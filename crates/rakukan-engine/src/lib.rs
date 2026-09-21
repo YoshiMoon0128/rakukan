@@ -712,7 +712,7 @@ pub struct RakunEngine {
 impl RakunEngine {
     pub fn new(config: EngineConfig) -> Self {
         #[cfg(feature = "rerank")]
-        let reranker = rerank::Reranker::from_settings(&config.rerank);
+        let reranker = rerank::Reranker::from_settings(&config.rerank, config.typo.max_alternatives);
         #[cfg(not(feature = "rerank"))]
         if config.rerank.enabled {
             tracing::warn!("[rerank] enabled = true but this engine DLL was built without feature \"rerank\"; ignoring");
@@ -1364,12 +1364,13 @@ impl RakunEngine {
         }
         let mut added = 0;
         for alt in &alts {
-            // 表層が読みそのまま（ひらがな項目）の候補は補正として無意味なので足さない
+            // 表層が読みそのままでも足す（「ありがとう」のように辞書の先頭がひらがなの語がある）。
+            // 「かきい」のような屑は審判（LM）が下げる
             let surface = store
                 .lookup_user(&alt.reading)
                 .into_iter()
                 .chain(store.lookup_dict(&alt.reading, 1))
-                .find(|s| !merged.contains(s) && s != &alt.reading);
+                .find(|s| !merged.contains(s));
             if let Some(s) = surface {
                 debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s);
                 merged.push(s);

@@ -45,6 +45,8 @@ pub struct RerankConfig {
     pub left_chars: usize,
     /// 読みがこれより長いときは採点しない（呼び元 `merge_candidates_for_reading_with_context` が見る）
     pub max_reading_chars: usize,
+    /// 元の候補に加えて採点する補正候補（`[typo]`）の最大数。KV の sequence 数はこの分も確保する
+    pub max_extra: usize,
 }
 
 impl Default for RerankConfig {
@@ -57,6 +59,7 @@ impl Default for RerankConfig {
             require_right_context: false,
             left_chars: 200,
             max_reading_chars: 12,
+            max_extra: 4,
         }
     }
 }
@@ -71,6 +74,8 @@ impl From<&RerankSettings> for RerankConfig {
             require_right_context: s.require_right_context,
             left_chars: s.left_chars.max(1),
             max_reading_chars: s.max_reading_chars.max(1),
+            // `[rerank]` だけでは分からない。`Reranker::from_settings` が `[typo] max_alternatives` で上書きする
+            max_extra: 0,
         }
     }
 }
@@ -144,22 +149,29 @@ pub fn rank_indices_with_costs(lm_scores: &[f32], lambda: f32, rho: f32, edit_co
 /// `merged` の先頭 `pinned` 個（学習履歴・ユーザー辞書由来）を固定し、その後ろの最大 `max_candidates` 個を
 /// `lm_scores` で並べ替える。`lm_scores.len()` は並べ替え対象の数と一致していること。
 pub fn reorder(merged: Vec<String>, pinned: usize, lm_scores: &[f32], cfg: &RerankConfig) -> Vec<String> {
-    reorder_with_costs(merged, pinned, lm_scores, cfg, &[], 0.0)
+    let pinned = pinned.min(merged.len());
+    let end = (pinned + lm_scores.len()).min(merged.len());
+    let idx: Vec<usize> = (pinned..end).collect();
+    let zero = vec![0.0f32; idx.len()];
+    assemble_ranked(merged, &idx, &lm_scores[..idx.len()], cfg, &zero, 0.0)
 }
 
 /// `reorder` に編集コストを足した版。`edit_costs` は並べ替え対象（`merged[pinned..pinned+n]`）に対応する。
-pub fn reorder_with_costs(merged: Vec<String>, pinned: usize, lm_scores: &[f32], cfg: &RerankConfig, edit_costs: &[f32], mu: f32) -> Vec<String> {
-    let pinned = pinned.min(merged.len());
-    let end = (pinned + lm_scores.len()).min(merged.len());
-    if lm_scores.is_empty() || end <= pinned {
+/// `idx`（`target_indices` の戻り）にある候補を採点順に並べ、最初の対象の位置にまとめて置く。
+/// 対象でない候補（固定の先頭、窓から漏れた元の候補、余った補正候補）は元の順のまま。
+pub fn assemble_ranked(merged: Vec<String>, idx: &[usize], lm_scores: &[f32], cfg: &RerankConfig, edit_costs: &[f32], mu: f32) -> Vec<String> {
+    if idx.is_empty() || idx.len() != lm_scores.len() || idx.iter().any(|&i| i >= merged.len()) {
         return merged;
     }
     let order = rank_indices_with_costs(lm_scores, cfg.lambda, cfg.rho, edit_costs, mu);
     let mut out: Vec<String> = Vec::with_capacity(merged.len());
-    out.extend_from_slice(&merged[..pinned]);
-    let target = &merged[pinned..end];
-    out.extend(order.into_iter().map(|i| target[i].clone()));
-    out.extend_from_slice(&merged[end..]);
+    for (i, c) in merged.iter().enumerate() {
+        if i == idx[0] {
+            out.extend(order.iter().map(|&k| merged[idx[k]].clone()));
+        } else if !idx.contains(&i) {
+            out.push(c.clone());
+        }
+    }
     out
 }
 
@@ -174,14 +186,13 @@ pub fn split_targets(merged: &[String], learn: &[String], user: &[String], max_c
     (pinned, rest.min(max_candidates))
 }
 
-/// `split_targets` に、末尾側に連続して置かれた `extra` 個の補正候補を足す版。
-/// 対象 = 元の候補のうち先頭 `max_candidates` 個 + 補正候補 `extra` 個（呼び元がその直後に並べている）。
-pub fn split_targets_extra(merged: &[String], learn: &[String], user: &[String], max_candidates: usize, extra: usize) -> (usize, usize) {
-    let (pinned, n) = split_targets(merged, learn, user, max_candidates);
-    let rest = merged.len().saturating_sub(pinned);
-    let extra = extra.min(rest);
-    let originals = rest - extra;
-    (pinned, n.min(originals) + extra)
+/// 採点対象の添字。元の候補（`merged` の先頭 `len - extra` 個）のうち固定分を除いた先頭 `max_candidates` 個と、
+/// 末尾に置かれた補正候補 `extra` 個。呼び元（`append_typo_alternatives`）は補正候補を `merged` の末尾に push する。
+pub fn target_indices(merged: &[String], learn: &[String], user: &[String], max_candidates: usize, extra: usize) -> Vec<usize> {
+    let extra = extra.min(merged.len());
+    let orig_len = merged.len() - extra;
+    let (pinned, n) = split_targets(&merged[..orig_len], learn, user, max_candidates);
+    (pinned..pinned + n).chain(orig_len..orig_len + extra).collect()
 }
 
 /// 文字列の末尾 `n` 文字。
@@ -211,6 +222,9 @@ pub struct ScorerSession<'a> {
     ctx: LlamaContext<'a>,
     model: &'a LlamaModel,
     cache: PrefixCache,
+    /// context を作ったときの sequence 数。候補がこれ（seq 0 は prefix 用）を超えると llama.cpp が
+    /// `GGML_ASSERT(seq_id_dst < seq_to_stream.size())` で abort するので、手前で Err にする
+    n_seq_max: usize,
 }
 
 fn log_softmax_pick(logits: &[f32], target: LlamaToken) -> f32 {
@@ -236,7 +250,7 @@ impl Scorer {
             .with_n_threads(self.n_threads)
             .with_n_threads_batch(self.n_threads);
         let ctx = self.model.new_context(self.backend, cparams).map_err(|e| e.to_string())?;
-        Ok(ScorerSession { ctx, model: &self.model, cache: PrefixCache::default() })
+        Ok(ScorerSession { ctx, model: &self.model, cache: PrefixCache::default(), n_seq_max: self.n_seq_max as usize })
     }
 }
 
@@ -280,6 +294,9 @@ impl ScorerSession<'_> {
             .map(|c| self.tokens(&format!("{c}{head}")))
             .collect::<Result<Vec<_>, _>>()?;
         let n = tails.len();
+        if n > self.n_seq_max {
+            return Err(format!("{n} candidates exceed n_seq_max={} (seq 0 is the prefix)", self.n_seq_max));
+        }
         self.ensure_prefix(&prefix, n)?;
         let plen = prefix.len();
         for s in 1..n {
@@ -396,22 +413,24 @@ pub struct Reranker {
 impl Reranker {
     /// `config.toml` の `[rerank]` からリランカーを作る。`enabled = false` なら None。
     /// モデルの取得とロードは別スレッドで進み、この関数はすぐ返る。
-    pub fn from_settings(settings: &RerankSettings) -> Option<Self> {
+    /// `max_extra` は `[typo] max_alternatives`（補正候補の最大数）。KV の sequence はこの分も確保する。
+    pub fn from_settings(settings: &RerankSettings, max_extra: usize) -> Option<Self> {
         if !settings.enabled {
             return None;
         }
         let s = settings.clone();
-        let cfg = RerankConfig::from(settings);
+        let cfg = RerankConfig { max_extra, ..RerankConfig::from(settings) };
         let n_threads = effective_threads(settings.threads);
         let timeout = Duration::from_millis(settings.timeout_ms.max(1));
-        let n_seq_max = cfg.max_candidates as u32 + 1;
+        let n_seq_max = (cfg.max_candidates + cfg.max_extra) as u32 + 1;
         let tail = cfg.right_tail_chars;
         tracing::info!(
-            "rerank: enabled model={} lambda={} threads={} max_candidates={} timeout_ms={}",
+            "rerank: enabled model={} lambda={} threads={} max_candidates={} max_extra={} timeout_ms={}",
             s.model,
             cfg.lambda,
             n_threads,
             cfg.max_candidates,
+            cfg.max_extra,
             settings.timeout_ms
         );
         Some(Self::spawn(cfg, timeout, move || {
@@ -424,7 +443,7 @@ impl Reranker {
     /// GGUF のパスを直接指定して作る（テストと CLI 用）。ロードが終わるまで待つ。
     pub fn load(model_path: impl AsRef<Path>, cfg: RerankConfig, n_threads: u32) -> Result<Self, String> {
         let path = model_path.as_ref().to_path_buf();
-        let n_seq_max = cfg.max_candidates.max(1) as u32 + 1;
+        let n_seq_max = (cfg.max_candidates.max(1) + cfg.max_extra) as u32 + 1;
         let tail = cfg.right_tail_chars;
         let rr = Self::spawn(cfg, Duration::from_secs(30), move || load_llama_backend(&path, n_threads, n_seq_max, tail));
         if rr.wait_ready(Duration::from_secs(600)) {
@@ -536,14 +555,16 @@ impl Reranker {
             tracing::debug!("rerank: skipped reason=no_context extra={extra}");
             return merged;
         }
-        let (pinned, n) = split_targets_extra(&merged, learn, user, self.cfg.max_candidates, extra);
-        if n < 2 {
-            tracing::debug!("rerank: skipped reason=single_target pinned={pinned} n={n}");
+        // 補正候補は KV の sequence 数（max_extra）まで。余った補正候補は末尾に残る
+        let extra = extra.min(self.cfg.max_extra).min(merged.len());
+        let idx = target_indices(&merged, learn, user, self.cfg.max_candidates, extra);
+        if idx.len() < 2 {
+            tracing::debug!("rerank: skipped reason=single_target targets={}", idx.len());
             return merged;
         }
         let left_tail = tail_chars(left, self.cfg.left_chars);
-        let targets = merged[pinned..pinned + n].to_vec();
-        let target_costs: Vec<f32> = (pinned..pinned + n).map(|i| edit_costs.get(i).copied().unwrap_or(0.0)).collect();
+        let targets: Vec<String> = idx.iter().map(|&i| merged[i].clone()).collect();
+        let target_costs: Vec<f32> = idx.iter().map(|&i| edit_costs.get(i).copied().unwrap_or(0.0)).collect();
 
         let mut chan = match self.chan.lock() {
             Ok(g) => g,
@@ -555,7 +576,7 @@ impl Reranker {
         }
         let id = chan.next_id;
         chan.next_id += 1;
-        let job = Job { id, left: left_tail, right: right.map(str::to_owned), candidates: targets };
+        let job = Job { id, left: left_tail, right: right.map(str::to_owned), candidates: targets.clone() };
         if chan.tx.send(job).is_err() {
             return merged;
         }
@@ -567,7 +588,10 @@ impl Reranker {
                     return match reply.scores {
                         Ok(sc) => {
                             tracing::debug!("rerank: scored {} candidates in {} ms", sc.len(), reply.elapsed.as_millis());
-                            reorder_with_costs(merged, pinned, &sc, &self.cfg, &target_costs, mu)
+                            for ((t, s), c) in targets.iter().zip(&sc).zip(&target_costs) {
+                                tracing::debug!("rerank: cand={t:?} lm={s:.2} cost={c}");
+                            }
+                            assemble_ranked(merged, &idx, &sc, &self.cfg, &target_costs, mu)
                         }
                         Err(e) => {
                             tracing::warn!("rerank: scoring failed, keeping dictionary order: {e}");
@@ -647,12 +671,42 @@ mod tests {
     }
 
     #[test]
-    fn split_targets_extra_は補正候補のぶん対象の窓を広げる() {
-        // 学習 1 + 元 5 + 補正 2。max_candidates 3 → 対象は元 3 + 補正 2 = 5
+    fn target_indices_は元の先頭と末尾の補正候補を対象にする() {
+        // 学習 1 + 元 5 + 補正 2。max_candidates 3 → 対象は a b c と x1 x2
         let merged = s(&["学", "a", "b", "c", "d", "e", "x1", "x2"]);
-        assert_eq!(split_targets_extra(&merged, &s(&["学"]), &[], 3, 2), (1, 5));
-        // 補正が無ければ split_targets と同じ
-        assert_eq!(split_targets_extra(&merged, &s(&["学"]), &[], 3, 0), (1, 3));
+        assert_eq!(target_indices(&merged, &s(&["学"]), &[], 3, 2), vec![1, 2, 3, 6, 7]);
+        // 補正が無ければ split_targets と同じ窓
+        assert_eq!(target_indices(&merged, &s(&["学"]), &[], 3, 0), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn assemble_ranked_は対象を採点順にまとめ_窓の外は元の順で残す() {
+        let merged = s(&["学", "a", "b", "c", "d", "e", "x1", "x2"]);
+        let idx = vec![1, 2, 3, 6, 7];
+        // x2 が最良、次に b。コストは無視（μ=0）
+        let out = assemble_ranked(merged, &idx, &[-9.0, -3.0, -9.0, -9.0, -1.0], &RerankConfig::default(), &[0.0; 5], 0.0);
+        assert_eq!(out, s(&["学", "x2", "b", "a", "c", "x1", "d", "e"]));
+    }
+
+    #[test]
+    fn 補正候補が上限を超えても採点器に渡す候補は_max_candidates_plus_max_extra_以内() {
+        use std::sync::{Arc, Mutex};
+        let seen = Arc::new(Mutex::new(0usize));
+        struct Count(Arc<Mutex<usize>>);
+        impl ScoreBackend for Count {
+            fn score(&mut self, _l: &str, _r: Option<&str>, c: &[String]) -> Result<Vec<f32>, String> {
+                *self.0.lock().unwrap() = c.len();
+                Ok(vec![-1.0; c.len()])
+            }
+        }
+        let cfg = RerankConfig { max_candidates: 2, max_extra: 1, ..RerankConfig::default() };
+        let seen2 = seen.clone();
+        let rr = Reranker::spawn(cfg, Duration::from_secs(1), move || Ok(Box::new(Count(seen2)) as Box<dyn ScoreBackend>));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+        let merged = s(&["a", "b", "c", "x1", "x2", "x3"]);
+        let out = rr.rerank_with_costs("左", None, merged, &[], &[], &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2.0, 3);
+        assert_eq!(*seen.lock().unwrap(), 3);
+        assert_eq!(out.len(), 6);
     }
 
     #[test]
