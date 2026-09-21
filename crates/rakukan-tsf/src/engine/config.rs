@@ -95,17 +95,33 @@ impl Default for RerankConfig {
 pub struct TypoConfig {
     /// Backspace で消して打ち直した打鍵列を `%LOCALAPPDATA%\rakukan\typo.log` に残す。既定 false
     pub log: bool,
+    /// 誤入力補正を使うか（`[rerank] enabled` も要る）。既定 false
+    pub enabled: bool,
+    /// 候補に混ぜる補正後の読みの数
+    pub max_alternatives: usize,
+    /// 編集コストの係数（nat）。大きいほど補正候補が上に来にくい
+    pub edit_penalty: f32,
+    /// これ以下の読み（かな数）だけ補正する
+    pub word_max_chars: usize,
 }
 
 impl Default for TypoConfig {
     fn default() -> Self {
-        Self { log: false }
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 2.0, word_max_chars: 8 }
     }
 }
 
 impl TypoConfig {
+    /// EngineConfig JSON の `"typo"` の値。engine 側 `TypoSettings` のフィールド名に合わせる。
     pub fn to_engine_json(&self) -> String {
-        format!(r#"{{"log":{}}}"#, self.log)
+        format!(
+            r#"{{"log":{},"enabled":{},"max_alternatives":{},"edit_penalty":{},"word_max_chars":{}}}"#,
+            self.log,
+            self.enabled,
+            self.max_alternatives,
+            json_number(self.edit_penalty),
+            self.word_max_chars
+        )
     }
 }
 
@@ -871,8 +887,15 @@ enabled = false
 # max_reading_chars = 12
 
 [typo]
-# 誤入力補正（開発中）。log = true で、Backspace で消して打ち直した打鍵列を
-# %LOCALAPPDATA%\rakukan\typo.log に残す（補正規則の重みを決める計測用。確定した文は書かない）
+# 誤入力補正（開発中）。ローマ字の打ち間違い（隣キー・二重打ち・抜け・入れ替え）を直した読みの候補を
+# 候補窓に混ぜ、[rerank] の LM が文脈で並べる。[rerank] enabled = true も要る。既定 off
+enabled = false
+# 候補に混ぜる補正後の読みの数、編集コストの係数（大きいほど補正候補が上に来にくい）、対象にする読みの長さ
+# max_alternatives = 4
+# edit_penalty = 2.0
+# word_max_chars = 8
+# log = true で、Backspace で消して打ち直した打鍵列を %LOCALAPPDATA%\rakukan\typo.log に残す
+# （補正規則の重みを決める計測用。確定した文は書かない）
 log = false
 
 # 旧形式との互換用:
@@ -984,9 +1007,11 @@ timeout_ms = 120
     fn typo_section_is_off_by_default_and_parses_when_present() {
         let cfg: AppConfig = toml::from_str("[general]\n").expect("parse");
         assert!(!cfg.typo.log);
-        assert_eq!(cfg.typo.to_engine_json(), r#"{"log":false}"#);
-        let cfg: AppConfig = toml::from_str("[typo]\nlog = true\n").expect("parse");
-        assert!(cfg.typo.log);
+        assert!(!cfg.typo.enabled);
+        assert!(cfg.typo.to_engine_json().starts_with(r#"{"log":false,"enabled":false,"max_alternatives":4"#));
+        let cfg: AppConfig = toml::from_str("[typo]\nlog = true\nenabled = true\nedit_penalty = 1.5\n").expect("parse");
+        assert!(cfg.typo.log && cfg.typo.enabled);
+        assert!(cfg.typo.to_engine_json().contains(r#""edit_penalty":1.5"#));
         let cfg: AppConfig = toml::from_str("[rerank]\nmax_reading_chars = 8\n").expect("parse");
         assert!(cfg.rerank.to_engine_json().contains(r#""max_reading_chars":8"#));
     }

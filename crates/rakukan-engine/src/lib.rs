@@ -37,6 +37,7 @@ pub mod ffi;
 pub mod segments;
 #[cfg(feature = "rerank")]
 pub mod rerank;
+pub mod typo;
 pub mod typo_log;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
@@ -278,11 +279,19 @@ fn default_confidence_margin() -> Option<f32> {
 pub struct TypoSettings {
     /// Backspace で消して打ち直した打鍵列を `%LOCALAPPDATA%\rakukan\typo.log` に残す。既定 false
     pub log: bool,
+    /// 誤入力補正を使うか。`rerank.enabled` も要る（補正候補の審判がリランカーなので）。既定 false
+    pub enabled: bool,
+    /// 候補に混ぜる補正後の読みの数（1 読みにつき辞書の先頭 1 語）
+    pub max_alternatives: usize,
+    /// 事前分布に足す編集コストの係数（nat）。補正候補が元の候補を追い越すには LM が e^μ 倍以上の確信を要する
+    pub edit_penalty: f32,
+    /// これ以下の読み（かな数）だけ補正する。長い読みは jinen の文候補の領分
+    pub word_max_chars: usize,
 }
 
 impl Default for TypoSettings {
     fn default() -> Self {
-        Self { log: false }
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 2.0, word_max_chars: 8 }
     }
 }
 
@@ -1311,6 +1320,53 @@ impl RakunEngine {
         self.reranker = reranker;
     }
 
+    /// 今の composition の打鍵を romaji ユニット（1 かなぶんの `typed`）で返す。
+    /// `force_preedit` で表示を差し替えた後（detach）や、数字・記号・Shift 英字が混ざるときは None。
+    fn romaji_units(&self) -> Option<Vec<String>> {
+        let entries = &self.input_log[self.log_detached_at.min(self.input_log.len())..];
+        if entries.is_empty() || entries.iter().any(|e| e.kind != InputKind::Romaji) {
+            return None;
+        }
+        let output: String = entries.iter().map(|e| e.output.as_str()).collect();
+        if output != self.hiragana_buf {
+            return None;
+        }
+        Some(entries.iter().map(|e| e.typed.clone()).collect())
+    }
+
+    /// 誤入力補正の候補を `merged` の直後に足す（段取り 2）。戻りは（候補列, 各候補の編集コスト, 足した数）。
+    ///
+    /// `hiragana` が今の composition と一致するときだけ（`input_log` がその打鍵）。補正後の読みごとに辞書の
+    /// 先頭 1 語を候補にし、既に `merged` にある表層は足さない。審判（リランカー）が使う編集コストを添える。
+    #[cfg(feature = "rerank")]
+    fn append_typo_alternatives(&self, hiragana: &str, mut merged: Vec<String>) -> (Vec<String>, Vec<f32>, usize) {
+        let mut costs = vec![0.0f32; merged.len()];
+        let t = &self.config.typo;
+        if !t.enabled || hiragana != self.hiragana_buf || hiragana.chars().count() > t.word_max_chars {
+            return (merged, costs, 0);
+        }
+        let (Some(units), Some(store)) = (self.romaji_units(), self.dict_store.as_ref()) else {
+            return (merged, costs, 0);
+        };
+        let has = |r: &str| !store.lookup_dict(r, 1).is_empty() || !store.lookup_user(r).is_empty();
+        let alts = typo::alternatives(&units, hiragana, &typo::Rule::ALL, t.max_alternatives, &has);
+        let mut added = 0;
+        for alt in &alts {
+            let surface = store
+                .lookup_user(&alt.reading)
+                .into_iter()
+                .chain(store.lookup_dict(&alt.reading, 1))
+                .find(|s| !merged.contains(s));
+            if let Some(s) = surface {
+                debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s);
+                merged.push(s);
+                costs.push(alt.cost);
+                added += 1;
+            }
+        }
+        (merged, costs, added)
+    }
+
     /// jinen（漢字変換 LLM）が使える状態か。engine が持っているか、BG 変換に貸し出し中かのどちらか。
     fn llm_available(&self) -> bool {
         self.kanji.is_some() || conv_cache::has_converter()
@@ -1424,7 +1480,10 @@ impl RakunEngine {
                     Some(l) if !l.is_empty() => l,
                     _ => self.committed.as_str(),
                 };
-                rr.rerank(left, right_context, merged, &learn_cands, &user_cands)
+                // 誤入力補正（段取り 2）: 補正後の読みの辞書候補を末尾に足し、編集コスト付きで審判にかける。
+                // 採点できないときは辞書順のまま返るので、補正候補は元の候補の後ろに残る
+                let (merged, costs, extra) = self.append_typo_alternatives(hiragana, merged);
+                rr.rerank_with_costs(left, right_context, merged, &learn_cands, &user_cands, &costs, self.config.typo.edit_penalty, extra)
             }
             _ => merged,
         };
@@ -3147,5 +3206,70 @@ mod rerank_timing_policy_tests {
     fn jinen_が使えないなら辞書だけのマージが最終なので採点する() {
         assert!(should_rerank_now(true, false));
         assert!(should_rerank_now(false, false));
+    }
+}
+
+#[cfg(all(test, feature = "rerank"))]
+mod typo_integration_tests {
+    //! 誤入力補正（段取り 2）: 補正後の読みの辞書候補が候補窓に混ざり、審判が文脈で上に上げる。
+    use super::*;
+    use std::time::Duration;
+
+    /// 2 番目の候補を常に最良にする偽の採点器
+    struct Second;
+    impl rerank::ScoreBackend for Second {
+        fn score(&mut self, _l: &str, _r: Option<&str>, c: &[String]) -> Result<Vec<f32>, String> {
+            Ok((0..c.len()).map(|i| if i == 1 { -1.0 } else { -10.0 }).collect())
+        }
+    }
+
+    fn engine(typo_enabled: bool) -> (RakunEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(&user_path, "[[entries]]\nreading = \"かんじ\"\nsurfaces = [\"感じ\"]\n").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut e = RakunEngine::new(EngineConfig {
+            typo: TypoSettings { enabled: typo_enabled, ..TypoSettings::default() },
+            ..EngineConfig::default()
+        });
+        e.set_dict_store(store);
+        let rr = rerank::Reranker::spawn(rerank::RerankConfig::default(), Duration::from_secs(1), || Ok(Box::new(Second)));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+        e.set_reranker(Some(rr));
+        (e, dir)
+    }
+
+    #[test]
+    fn 隣のキーを打った読みでも辞書の語が補正候補に混ざり_lm_が先頭に上げる() {
+        let (mut e, _dir) = engine(true);
+        for c in "kanhi".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.hiragana_text(), "かんひ");
+        // h の隣は j: かんひ → かんじ → ユーザー辞書「感じ」。LLM 候補があるので最終マージ扱い
+        let out = e.merge_candidates_for_reading_with_context("かんひ", vec!["かんひ".into()], 6, Some("いい"), None);
+        assert_eq!(out[0], "感じ", "{out:?}");
+        assert!(out.contains(&"かんひ".to_string()));
+    }
+
+    #[test]
+    fn 補正が_off_なら補正候補は混ざらない() {
+        let (mut e, _dir) = engine(false);
+        for c in "kanhi".chars() {
+            e.push_char(c);
+        }
+        let out = e.merge_candidates_for_reading_with_context("かんひ", vec!["かんひ".into()], 6, Some("いい"), None);
+        assert!(!out.contains(&"感じ".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn 読みが今の_composition_と違うときは補正しない() {
+        let (mut e, _dir) = engine(true);
+        for c in "kanhi".chars() {
+            e.push_char(c);
+        }
+        // 別の読みで呼ばれた（BG の take_key など）ときは input_log が対応しないので補正しない
+        let out = e.merge_candidates_for_reading_with_context("かんび", vec!["かんび".into()], 6, Some("いい"), None);
+        assert!(!out.contains(&"感じ".to_string()), "{out:?}");
     }
 }

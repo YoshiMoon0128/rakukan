@@ -120,6 +120,13 @@ fn log_softmax(xs: &[f32]) -> Vec<f32> {
 ///
 /// `lm_scores[i]` は辞書順 i 番目の候補の log P(候補 | 左文脈)。同点は辞書順で安定させる。
 pub fn rank_indices(lm_scores: &[f32], lambda: f32, rho: f32) -> Vec<usize> {
+    rank_indices_with_costs(lm_scores, lambda, rho, &[], 0.0)
+}
+
+/// `rank_indices` に編集コスト（誤入力補正の候補が持つ）を足した版。
+/// `final = λ·log_softmax(LM) + (1−λ)·log_prior(辞書順) − μ·edit_cost`。`edit_costs` が空なら 0 扱い。
+/// μ は「補正候補が元の候補を追い越すには LM が e^μ 倍以上の確信を持つ必要がある」の意味。
+pub fn rank_indices_with_costs(lm_scores: &[f32], lambda: f32, rho: f32, edit_costs: &[f32], mu: f32) -> Vec<usize> {
     let n = lm_scores.len();
     if n == 0 {
         return Vec::new();
@@ -127,7 +134,8 @@ pub fn rank_indices(lm_scores: &[f32], lambda: f32, rho: f32) -> Vec<usize> {
     let lm = log_softmax(lm_scores);
     let prior_raw: Vec<f32> = (0..n).map(|i| i as f32 * rho.ln()).collect();
     let prior = log_softmax(&prior_raw);
-    let final_: Vec<f32> = lm.iter().zip(&prior).map(|(a, b)| lambda * a + (1.0 - lambda) * b).collect();
+    let edit = |i: usize| edit_costs.get(i).copied().unwrap_or(0.0);
+    let final_: Vec<f32> = (0..n).map(|i| lambda * lm[i] + (1.0 - lambda) * prior[i] - mu * edit(i)).collect();
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| final_[b].partial_cmp(&final_[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
     idx
@@ -136,12 +144,17 @@ pub fn rank_indices(lm_scores: &[f32], lambda: f32, rho: f32) -> Vec<usize> {
 /// `merged` の先頭 `pinned` 個（学習履歴・ユーザー辞書由来）を固定し、その後ろの最大 `max_candidates` 個を
 /// `lm_scores` で並べ替える。`lm_scores.len()` は並べ替え対象の数と一致していること。
 pub fn reorder(merged: Vec<String>, pinned: usize, lm_scores: &[f32], cfg: &RerankConfig) -> Vec<String> {
+    reorder_with_costs(merged, pinned, lm_scores, cfg, &[], 0.0)
+}
+
+/// `reorder` に編集コストを足した版。`edit_costs` は並べ替え対象（`merged[pinned..pinned+n]`）に対応する。
+pub fn reorder_with_costs(merged: Vec<String>, pinned: usize, lm_scores: &[f32], cfg: &RerankConfig, edit_costs: &[f32], mu: f32) -> Vec<String> {
     let pinned = pinned.min(merged.len());
     let end = (pinned + lm_scores.len()).min(merged.len());
     if lm_scores.is_empty() || end <= pinned {
         return merged;
     }
-    let order = rank_indices(lm_scores, cfg.lambda, cfg.rho);
+    let order = rank_indices_with_costs(lm_scores, cfg.lambda, cfg.rho, edit_costs, mu);
     let mut out: Vec<String> = Vec::with_capacity(merged.len());
     out.extend_from_slice(&merged[..pinned]);
     let target = &merged[pinned..end];
@@ -159,6 +172,16 @@ pub fn split_targets(merged: &[String], learn: &[String], user: &[String], max_c
         .count();
     let rest = merged.len().saturating_sub(pinned);
     (pinned, rest.min(max_candidates))
+}
+
+/// `split_targets` に、末尾側に連続して置かれた `extra` 個の補正候補を足す版。
+/// 対象 = 元の候補のうち先頭 `max_candidates` 個 + 補正候補 `extra` 個（呼び元がその直後に並べている）。
+pub fn split_targets_extra(merged: &[String], learn: &[String], user: &[String], max_candidates: usize, extra: usize) -> (usize, usize) {
+    let (pinned, n) = split_targets(merged, learn, user, max_candidates);
+    let rest = merged.len().saturating_sub(pinned);
+    let extra = extra.min(rest);
+    let originals = rest - extra;
+    (pinned, n.min(originals) + extra)
 }
 
 /// 文字列の末尾 `n` 文字。
@@ -478,6 +501,26 @@ impl Reranker {
 
     /// `merged` を並べ替えて返す。ロード前・失敗・タイムアウト・採点エラーのどれでも `merged` をそのまま返す。
     pub fn rerank(&self, left: &str, right: Option<&str>, merged: Vec<String>, learn: &[String], user: &[String]) -> Vec<String> {
+        self.rerank_with_costs(left, right, merged, learn, user, &[], 0.0, 0)
+    }
+
+    /// `rerank` に、誤入力補正の候補（編集コスト付き）を含める版。
+    ///
+    /// `edit_costs[i]` は `merged[i]` の編集コスト（元の候補は 0）。`extra` 個の補正候補は、呼び元が
+    /// 元の並べ替え対象（`max_candidates` 個）の直後に連続して置いていること。対象の窓をその分だけ広げる。
+    /// 採点できないときは `merged` をそのまま返すので、補正候補は元の候補の後ろに残る。
+    #[allow(clippy::too_many_arguments)]
+    pub fn rerank_with_costs(
+        &self,
+        left: &str,
+        right: Option<&str>,
+        merged: Vec<String>,
+        learn: &[String],
+        user: &[String],
+        edit_costs: &[f32],
+        mu: f32,
+        extra: usize,
+    ) -> Vec<String> {
         if !self.is_ready() {
             return merged;
         }
@@ -489,12 +532,13 @@ impl Reranker {
         if left.trim().is_empty() && right.map_or(true, |r| r.trim().is_empty()) {
             return merged;
         }
-        let (pinned, n) = split_targets(&merged, learn, user, self.cfg.max_candidates);
+        let (pinned, n) = split_targets_extra(&merged, learn, user, self.cfg.max_candidates, extra);
         if n < 2 {
             return merged;
         }
         let left_tail = tail_chars(left, self.cfg.left_chars);
         let targets = merged[pinned..pinned + n].to_vec();
+        let target_costs: Vec<f32> = (pinned..pinned + n).map(|i| edit_costs.get(i).copied().unwrap_or(0.0)).collect();
 
         let mut chan = match self.chan.lock() {
             Ok(g) => g,
@@ -518,7 +562,7 @@ impl Reranker {
                     return match reply.scores {
                         Ok(sc) => {
                             tracing::debug!("rerank: scored {} candidates in {} ms", sc.len(), reply.elapsed.as_millis());
-                            reorder(merged, pinned, &sc, &self.cfg)
+                            reorder_with_costs(merged, pinned, &sc, &self.cfg, &target_costs, mu)
                         }
                         Err(e) => {
                             tracing::warn!("rerank: scoring failed, keeping dictionary order: {e}");
@@ -584,6 +628,26 @@ mod tests {
     #[test]
     fn rank_indices_は同点を辞書順で安定させる() {
         assert_eq!(rank_indices(&[-5.0, -5.0, -5.0], 1.0, 0.5), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn 編集コストは同じ_lm_スコアなら後ろに下げ_μが0なら無視される() {
+        // 候補 2 は補正候補（コスト 1.0）。LM が同点なら元の候補が先
+        assert_eq!(rank_indices_with_costs(&[-5.0, -5.0, -5.0], 1.0, 0.5, &[0.0, 0.0, 1.0], 2.0), vec![0, 1, 2]);
+        // LM が e^2 倍以上（2 nat 超）確信していれば補正候補が追い越す
+        assert_eq!(rank_indices_with_costs(&[-5.0, -5.0, -2.5], 1.0, 0.5, &[0.0, 0.0, 1.0], 2.0), vec![2, 0, 1]);
+        assert_eq!(rank_indices_with_costs(&[-5.0, -5.0, -4.0], 1.0, 0.5, &[0.0, 0.0, 1.0], 2.0), vec![0, 1, 2]);
+        // μ=0 なら編集コストは効かない
+        assert_eq!(rank_indices_with_costs(&[-5.0, -5.0, -4.0], 1.0, 0.5, &[0.0, 0.0, 1.0], 0.0), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn split_targets_extra_は補正候補のぶん対象の窓を広げる() {
+        // 学習 1 + 元 5 + 補正 2。max_candidates 3 → 対象は元 3 + 補正 2 = 5
+        let merged = s(&["学", "a", "b", "c", "d", "e", "x1", "x2"]);
+        assert_eq!(split_targets_extra(&merged, &s(&["学"]), &[], 3, 2), (1, 5));
+        // 補正が無ければ split_targets と同じ
+        assert_eq!(split_targets_extra(&merged, &s(&["学"]), &[], 3, 0), (1, 3));
     }
 
     #[test]
