@@ -1342,21 +1342,34 @@ impl RakunEngine {
     fn append_typo_alternatives(&self, hiragana: &str, mut merged: Vec<String>) -> (Vec<String>, Vec<f32>, usize) {
         let mut costs = vec![0.0f32; merged.len()];
         let t = &self.config.typo;
-        if !t.enabled || hiragana != self.hiragana_buf || hiragana.chars().count() > t.word_max_chars {
+        if !t.enabled {
+            return (merged, costs, 0);
+        }
+        if hiragana != self.hiragana_buf {
+            debug!("typo: skipped reason=not_composing reading={hiragana:?}");
+            return (merged, costs, 0);
+        }
+        if hiragana.chars().count() > t.word_max_chars {
+            debug!("typo: skipped reason=too_long chars={} max={}", hiragana.chars().count(), t.word_max_chars);
             return (merged, costs, 0);
         }
         let (Some(units), Some(store)) = (self.romaji_units(), self.dict_store.as_ref()) else {
+            debug!("typo: skipped reason=no_units_or_dict");
             return (merged, costs, 0);
         };
         let has = |r: &str| !store.lookup_dict(r, 1).is_empty() || !store.lookup_user(r).is_empty();
         let alts = typo::alternatives(&units, hiragana, &typo::Rule::ALL, t.max_alternatives, &has);
+        if alts.is_empty() {
+            debug!("typo: no alternatives reading={hiragana:?} units={}", units.len());
+        }
         let mut added = 0;
         for alt in &alts {
+            // 表層が読みそのまま（ひらがな項目）の候補は補正として無意味なので足さない
             let surface = store
                 .lookup_user(&alt.reading)
                 .into_iter()
                 .chain(store.lookup_dict(&alt.reading, 1))
-                .find(|s| !merged.contains(s));
+                .find(|s| !merged.contains(s) && s != &alt.reading);
             if let Some(s) = surface {
                 debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s);
                 merged.push(s);

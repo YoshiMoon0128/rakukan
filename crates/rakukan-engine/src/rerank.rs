@@ -522,18 +522,23 @@ impl Reranker {
         extra: usize,
     ) -> Vec<String> {
         if !self.is_ready() {
+            tracing::debug!("rerank: skipped reason=not_ready");
             return merged;
         }
-        if self.cfg.require_right_context && right.map_or(true, |r| r.trim().is_empty()) {
+        let right_empty = right.map_or(true, |r| r.trim().is_empty());
+        if self.cfg.require_right_context && right_empty {
+            tracing::debug!("rerank: skipped reason=no_right_context");
             return merged;
         }
         // 文脈が左右どちらも無いとき（文書の先頭で確定文も無い）は並べ替えない。
         // 文脈ゼロの LM の好みは辞書順より当たらない（実機で「きかい」に「奇怪」が先頭に来た）
-        if left.trim().is_empty() && right.map_or(true, |r| r.trim().is_empty()) {
+        if left.trim().is_empty() && right_empty {
+            tracing::debug!("rerank: skipped reason=no_context extra={extra}");
             return merged;
         }
         let (pinned, n) = split_targets_extra(&merged, learn, user, self.cfg.max_candidates, extra);
         if n < 2 {
+            tracing::debug!("rerank: skipped reason=single_target pinned={pinned} n={n}");
             return merged;
         }
         let left_tail = tail_chars(left, self.cfg.left_chars);
