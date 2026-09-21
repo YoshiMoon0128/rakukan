@@ -148,6 +148,32 @@ impl MozcDict {
         self.n_entries as usize
     }
 
+    /// 全項目を読みの順に舐める（読み, 表層, cost）。誤入力補正の辞書づくりのように、
+    /// 読みで引くのではなく頻出語を集めたいときに使う。壊れた項目は飛ばす
+    pub fn for_each_entry(&self, mut f: impl FnMut(&str, &str, u16)) {
+        for i in 0..self.n_readings as usize {
+            let Some(reading) = self.reading_at(i) else { continue };
+            let (entries_start, n_tokens) = self.index_entry(i);
+            for j in 0..n_tokens as usize {
+                let record_off = self.entries_off + (entries_start as usize + j) * ENTRY_RECORD_SIZE;
+                if record_off + ENTRY_RECORD_SIZE > self.mmap.len() {
+                    break;
+                }
+                let surface_off = u32_le(&self.mmap, record_off) as usize;
+                let surface_len = u16_le(&self.mmap, record_off + 4) as usize;
+                let cost = u16_le(&self.mmap, record_off + 6);
+                let start = self.surface_heap_off + surface_off;
+                let end = start + surface_len;
+                if end > self.mmap.len() {
+                    break;
+                }
+                if let Ok(surface) = std::str::from_utf8(&self.mmap[start..end]) {
+                    f(reading, surface, cost);
+                }
+            }
+        }
+    }
+
     // ─ 内部ヘルパー ──────────────────────────────────────────────────────────
 
     /// 読みを二分探索して index 内の位置を返す

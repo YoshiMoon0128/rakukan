@@ -9,6 +9,7 @@ members = [
     "crates/rakukan-engine-rpc",
     "crates/rakukan-tray",
     "crates/rakukan-tsf",
+    "crates/rakukan-typo-dict",
 ]
 resolver = "2"
 

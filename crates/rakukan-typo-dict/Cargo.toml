@@ -1,0 +1,17 @@
+[package]
+name        = "rakukan-typo-dict"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "打ち間違いの読み → 正しい語 の一括登録用テキスト（MS-IME ユーザー辞書ツール形式）を mozc 辞書から作る"
+
+[[bin]]
+name = "rakukan-typo-dict"
+path = "src/main.rs"
+
+[dependencies]
+rakukan-dict   = { path = "../rakukan-dict" }
+rakukan-engine = { path = "../rakukan-engine" }
+anyhow = { workspace = true }
+clap   = { workspace = true }
