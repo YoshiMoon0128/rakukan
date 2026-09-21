@@ -480,6 +480,11 @@ impl Reranker {
         if self.cfg.require_right_context && right.map_or(true, |r| r.trim().is_empty()) {
             return merged;
         }
+        // 文脈が左右どちらも無いとき（文書の先頭で確定文も無い）は並べ替えない。
+        // 文脈ゼロの LM の好みは辞書順より当たらない（実機で「きかい」に「奇怪」が先頭に来た）
+        if left.trim().is_empty() && right.map_or(true, |r| r.trim().is_empty()) {
+            return merged;
+        }
         let (pinned, n) = split_targets(&merged, learn, user, self.cfg.max_candidates);
         if n < 2 {
             return merged;
@@ -611,6 +616,15 @@ mod tests {
         let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), || Err("no model".into()));
         assert!(!rr.wait_ready(Duration::from_secs(5)));
         assert_eq!(rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+    }
+
+    #[test]
+    fn 文脈が左右どちらも無ければ並べ替えない() {
+        let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), || fake(None));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+        assert_eq!(rr.rerank("", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("次の", None, s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
+        assert_eq!(rr.rerank("", Some("を待つ"), s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
     }
 
     #[test]
