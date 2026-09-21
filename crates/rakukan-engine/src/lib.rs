@@ -1372,30 +1372,45 @@ impl RakunEngine {
             let (pinned, n) = rerank::split_targets(&merged, learn, user, max);
             pinned + n
         };
+        // 足す補正候補は max_alternatives 個まで（審判の KV の sequence 数 = max_extra と同じ）
         let mut added = 0;
         for alt in &alts {
-            // 補正後の読みの先頭 1 語。表層が読みそのままでも足す（「ありがとう」のように辞書の先頭が
-            // ひらがなの語がある）。「かきい」のような屑は審判（LM）が下げる
-            let Some(s) = store.lookup_user(&alt.reading).into_iter().chain(store.lookup_dict(&alt.reading, 1)).next() else {
-                continue;
-            };
-            match merged.iter().position(|m| m == &s) {
-                // 元の候補として採点されるので、補正候補として足す意味がない
-                Some(p) if p < window_end => {
-                    debug!("typo: alt reading={:?} surface={:?} already in window pos={p}", alt.reading, s);
-                    continue;
-                }
-                // 窓の外（jinen の 5 番目以降など）にある。2 番手の表層を足すより、それを審判の前に引き上げる
-                Some(p) => {
-                    debug!("typo: alt reading={:?} rule={} cost={} surface={:?} promoted from pos={p}", alt.reading, alt.rule.name(), alt.cost, s);
-                    merged.remove(p);
-                    costs.remove(p);
-                }
-                None => debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s),
+            if added >= t.max_alternatives {
+                break;
             }
-            merged.push(s);
-            costs.push(alt.cost);
-            added += 1;
+            // 補正後の読みの表層（ユーザー辞書 → mozc の先頭 3 語）。表層が読みそのままでも足す
+            //（「ありがとう」のように辞書の先頭がひらがなの語がある）。「かきい」のような屑は審判（LM）が下げる
+            let surfaces: Vec<String> = store.lookup_user(&alt.reading).into_iter().chain(store.lookup_dict(&alt.reading, 3)).collect();
+            let Some(top) = surfaces.first().cloned() else { continue };
+            for s in &surfaces {
+                if added >= t.max_alternatives {
+                    break;
+                }
+                match merged.iter().position(|m| m == s) {
+                    // 元の候補として採点されるので、補正候補として足す意味がない
+                    Some(p) if p < window_end => {
+                        debug!("typo: alt reading={:?} surface={:?} already in window pos={p}", alt.reading, s);
+                    }
+                    // 窓の外（jinen の 5 番目以降など）にある。そこに残すより、審判の前に引き上げる
+                    //（kikkai → きかい では先頭の「機会」を足しつつ、jinen が 5 番目に出していた「機械」も上げる）
+                    Some(p) => {
+                        debug!("typo: alt reading={:?} rule={} cost={} surface={:?} promoted from pos={p}", alt.reading, alt.rule.name(), alt.cost, s);
+                        merged.remove(p);
+                        costs.remove(p);
+                        merged.push(s.clone());
+                        costs.push(alt.cost);
+                        added += 1;
+                    }
+                    // 無い表層は先頭の 1 語だけ足す
+                    None if *s == top => {
+                        debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s);
+                        merged.push(s.clone());
+                        costs.push(alt.cost);
+                        added += 1;
+                    }
+                    None => {}
+                }
+            }
         }
         (merged, costs, added)
     }
