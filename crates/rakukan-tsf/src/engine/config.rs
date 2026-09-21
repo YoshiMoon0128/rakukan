@@ -67,6 +67,8 @@ pub struct RerankConfig {
     pub timeout_ms: u64,
     /// 読みがこれより長いときは採点しない（長い読みの候補は LLM の文候補で、同音異義語ではない）
     pub max_reading_chars: usize,
+    /// リランカーのモデルを GPU に載せる層数。0 = CPU、999 = 全層。CUDA / Vulkan 版 engine DLL のときだけ効く
+    pub gpu_layers: u32,
 }
 
 impl Default for RerankConfig {
@@ -85,6 +87,7 @@ impl Default for RerankConfig {
             max_candidates: 6,
             timeout_ms: 150,
             max_reading_chars: 12,
+            gpu_layers: 0,
         }
     }
 }
@@ -133,7 +136,7 @@ impl RerankConfig {
             None => String::new(),
         };
         format!(
-            r#"{{"enabled":{},"model":{},"lambda":{},"rho":{},"require_right_context":{},"left_chars":{},"right_chars":{},"right_tail_chars":{},"threads":{},"max_candidates":{},"timeout_ms":{},"max_reading_chars":{}{}}}"#,
+            r#"{{"enabled":{},"model":{},"lambda":{},"rho":{},"require_right_context":{},"left_chars":{},"right_chars":{},"right_tail_chars":{},"threads":{},"max_candidates":{},"timeout_ms":{},"max_reading_chars":{},"gpu_layers":{}{}}}"#,
             self.enabled,
             json_string(&self.model),
             json_number(self.lambda),
@@ -146,6 +149,7 @@ impl RerankConfig {
             self.max_candidates,
             self.timeout_ms,
             self.max_reading_chars,
+            self.gpu_layers,
             model_path,
         )
     }
@@ -928,6 +932,9 @@ enabled = false
 # timeout_ms = 150
 # 読みがこれより長いときは並べ替えない（長い読みの候補は LLM の文候補で、同音異義語ではない）
 # max_reading_chars = 12
+# リランカーのモデルを GPU に載せる層数。0 = CPU、999 = 全層。
+# rakukan_engine_cuda.dll / rakukan_engine_vulkan.dll があるときだけ効く（CPU 版では無視）
+# gpu_layers = 0
 
 [typo]
 # 誤入力補正（開発中）。ローマ字の打ち間違い（隣キー・二重打ち・抜け・入れ替え）を直した読みの候補を

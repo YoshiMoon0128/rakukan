@@ -328,6 +328,9 @@ pub struct RerankSettings {
     pub timeout_ms: u64,
     /// 読みがこれより長いときは採点しない。長い読みの候補は jinen の文候補で、辞書由来の同音異義語ではない
     pub max_reading_chars: usize,
+    /// リランカーのモデルを GPU に載せる層数。0 = CPU（既定）、999 = 全層。
+    /// CUDA / Vulkan 版の engine DLL のときだけ効き、CPU 版では無視される
+    pub gpu_layers: u32,
 }
 
 impl Default for RerankSettings {
@@ -346,6 +349,7 @@ impl Default for RerankSettings {
             max_candidates: 6,
             timeout_ms: 150,
             max_reading_chars: 12,
+            gpu_layers: 0,
         }
     }
 }

@@ -234,9 +234,10 @@ fn log_softmax_pick(logits: &[f32], target: LlamaToken) -> f32 {
 }
 
 impl Scorer {
-    pub fn load(path: impl AsRef<Path>, n_threads: u32, n_seq_max: u32) -> Result<Self, String> {
+    /// `gpu_layers` は GPU に載せる層数（0 = CPU）。CPU 版の llama.cpp では無視される。
+    pub fn load(path: impl AsRef<Path>, n_threads: u32, n_seq_max: u32, gpu_layers: u32) -> Result<Self, String> {
         let backend = crate::kanji::llamacpp::get_backend().map_err(|e| e.to_string())?;
-        let mparams = LlamaModelParams::default().with_n_gpu_layers(0);
+        let mparams = LlamaModelParams::default().with_n_gpu_layers(gpu_layers);
         let model = LlamaModel::load_from_file(backend, path.as_ref(), &mparams).map_err(|e| e.to_string())?;
         Ok(Self { backend, model, n_threads: n_threads as i32, n_seq_max })
     }
@@ -351,8 +352,14 @@ impl ScoreBackend for LlamaScoreBackend {
     }
 }
 
-fn load_llama_backend(path: &Path, n_threads: u32, n_seq_max: u32, right_tail_chars: usize) -> Result<Box<dyn ScoreBackend>, String> {
-    let scorer = Box::new(Scorer::load(path, n_threads, n_seq_max)?);
+fn load_llama_backend(
+    path: &Path,
+    n_threads: u32,
+    n_seq_max: u32,
+    right_tail_chars: usize,
+    gpu_layers: u32,
+) -> Result<Box<dyn ScoreBackend>, String> {
+    let scorer = Box::new(Scorer::load(path, n_threads, n_seq_max, gpu_layers)?);
     // Box の中身は動かないので、session の借用を 'static に延ばしても指す先は変わらない。
     // 両方を同じ構造体に入れ、session → scorer の順で drop する。
     let scorer_ref: &'static Scorer = unsafe { &*(scorer.as_ref() as *const Scorer) };
@@ -424,19 +431,21 @@ impl Reranker {
         let timeout = Duration::from_millis(settings.timeout_ms.max(1));
         let n_seq_max = (cfg.max_candidates + cfg.max_extra) as u32 + 1;
         let tail = cfg.right_tail_chars;
+        let gpu_layers = settings.gpu_layers;
         tracing::info!(
-            "rerank: enabled model={} lambda={} threads={} max_candidates={} max_extra={} timeout_ms={}",
+            "rerank: enabled model={} lambda={} threads={} max_candidates={} max_extra={} timeout_ms={} gpu_layers={}",
             s.model,
             cfg.lambda,
             n_threads,
             cfg.max_candidates,
             cfg.max_extra,
-            settings.timeout_ms
+            settings.timeout_ms,
+            gpu_layers
         );
         Some(Self::spawn(cfg, timeout, move || {
             let path = resolve_model_path(&s)?;
             tracing::info!("rerank: loading {}", path.display());
-            load_llama_backend(&path, n_threads, n_seq_max, tail)
+            load_llama_backend(&path, n_threads, n_seq_max, tail, gpu_layers)
         }))
     }
 
@@ -445,7 +454,7 @@ impl Reranker {
         let path = model_path.as_ref().to_path_buf();
         let n_seq_max = (cfg.max_candidates.max(1) + cfg.max_extra) as u32 + 1;
         let tail = cfg.right_tail_chars;
-        let rr = Self::spawn(cfg, Duration::from_secs(30), move || load_llama_backend(&path, n_threads, n_seq_max, tail));
+        let rr = Self::spawn(cfg, Duration::from_secs(30), move || load_llama_backend(&path, n_threads, n_seq_max, tail, 0));
         if rr.wait_ready(Duration::from_secs(600)) {
             Ok(rr)
         } else {
