@@ -979,7 +979,10 @@ impl RakunEngine {
     }
 
     pub fn backspace(&mut self) -> bool {
-        if self.typo_log.is_some() && self.typo_before.is_none() {
+        // composition が空のときの Backspace はアプリ側の文字消しで、打ち直しではない。
+        // ここで捕まえると、その後に打った文がまるごと「打ち直し」として記録される（実機で踏んだ）
+        let composing = !self.hiragana_buf.is_empty() || !self.pending_romaji_buf.is_empty();
+        if composing && self.typo_log.is_some() && self.typo_before.is_none() {
             self.typo_before = Some((self.romaji_log_str(), self.hiragana_buf.clone()));
         }
         if !self.pending_romaji_buf.is_empty() {
@@ -3049,6 +3052,17 @@ mod typo_log_tests {
         e.backspace();
         type_all(&mut e, "ji");
         e.commit("漢字");
+        assert!(!dir.path().join("typo.log").exists());
+    }
+
+    #[test]
+    fn 何も打っていないときの_backspace_は打ち直しとして数えない() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with_log(dir.path());
+        // アプリ側の文字を消す Backspace（composition は空）→ そのあと文を打って確定
+        e.backspace();
+        type_all(&mut e, "mite");
+        e.commit("見て");
         assert!(!dir.path().join("typo.log").exists());
     }
 
