@@ -363,8 +363,24 @@ fn load_llama_backend(
     // Box の中身は動かないので、session の借用を 'static に延ばしても指す先は変わらない。
     // 両方を同じ構造体に入れ、session → scorer の順で drop する。
     let scorer_ref: &'static Scorer = unsafe { &*(scorer.as_ref() as *const Scorer) };
-    let session = scorer_ref.session()?;
+    let mut session = scorer_ref.session()?;
+    warm_up(&mut session, right_tail_chars);
     Ok(Box::new(LlamaScoreBackend { session, _scorer: scorer, right_tail_chars }))
+}
+
+/// ロード直後に 1 回だけダミーの採点を流す。最初の本番の採点が遅くて timeout で辞書順に落ちるのを防ぐ。
+/// GPU 版ではパイプラインの構築（実測 300 ms 超が 3 回）、CPU 版でもスレッドの起こし込みが初回に乗る。
+/// 結果は捨て、prefix の KV も残さない（本番の左文脈とは一致しないので次回は差分 decode になる）。
+fn warm_up(session: &mut ScorerSession<'_>, right_tail_chars: usize) {
+    let candidates: Vec<String> = ["機械", "機会", "器械", "奇怪", "喜界", "気海", "きかい", "機かい"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let t = Instant::now();
+    match session.score("今日はいい天気なので、", Some("を見に行く"), &candidates, right_tail_chars) {
+        Ok(_) => tracing::info!("rerank: warm-up scored {} candidates in {} ms", candidates.len(), t.elapsed().as_millis()),
+        Err(e) => tracing::warn!("rerank: warm-up failed (continuing): {e}"),
+    }
 }
 
 struct Job {
