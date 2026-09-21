@@ -24,6 +24,8 @@ pub struct AppConfig {
     pub diagnostics: DiagnosticsConfig,
     #[serde(default)]
     pub rerank: RerankConfig,
+    #[serde(default)]
+    pub typo: TypoConfig,
 
     /// 旧形式との互換用（config.toml に num_candidates = N と書いた場合に有効）。
     #[serde(default)]
@@ -63,6 +65,8 @@ pub struct RerankConfig {
     pub max_candidates: usize,
     /// 採点をこれ以上待たない（ms）。超えたら辞書順のまま出す
     pub timeout_ms: u64,
+    /// 読みがこれより長いときは採点しない（長い読みの候補は LLM の文候補で、同音異義語ではない）
+    pub max_reading_chars: usize,
 }
 
 impl Default for RerankConfig {
@@ -80,7 +84,28 @@ impl Default for RerankConfig {
             threads: 0,
             max_candidates: 6,
             timeout_ms: 150,
+            max_reading_chars: 12,
         }
+    }
+}
+
+/// 誤入力補正（`[typo]`）。いまは計測ログの on/off だけ。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TypoConfig {
+    /// Backspace で消して打ち直した打鍵列を `%LOCALAPPDATA%\rakukan\typo.log` に残す。既定 false
+    pub log: bool,
+}
+
+impl Default for TypoConfig {
+    fn default() -> Self {
+        Self { log: false }
+    }
+}
+
+impl TypoConfig {
+    pub fn to_engine_json(&self) -> String {
+        format!(r#"{{"log":{}}}"#, self.log)
     }
 }
 
@@ -92,7 +117,7 @@ impl RerankConfig {
             None => String::new(),
         };
         format!(
-            r#"{{"enabled":{},"model":{},"lambda":{},"rho":{},"require_right_context":{},"left_chars":{},"right_chars":{},"right_tail_chars":{},"threads":{},"max_candidates":{},"timeout_ms":{}{}}}"#,
+            r#"{{"enabled":{},"model":{},"lambda":{},"rho":{},"require_right_context":{},"left_chars":{},"right_chars":{},"right_tail_chars":{},"threads":{},"max_candidates":{},"timeout_ms":{},"max_reading_chars":{}{}}}"#,
             self.enabled,
             json_string(&self.model),
             json_number(self.lambda),
@@ -104,6 +129,7 @@ impl RerankConfig {
             self.threads,
             self.max_candidates,
             self.timeout_ms,
+            self.max_reading_chars,
             model_path,
         )
     }
@@ -841,6 +867,13 @@ enabled = false
 # threads = 0
 # max_candidates = 6
 # timeout_ms = 150
+# 読みがこれより長いときは並べ替えない（長い読みの候補は LLM の文候補で、同音異義語ではない）
+# max_reading_chars = 12
+
+[typo]
+# 誤入力補正（開発中）。log = true で、Backspace で消して打ち直した打鍵列を
+# %LOCALAPPDATA%\rakukan\typo.log に残す（補正規則の重みを決める計測用。確定した文は書かない）
+log = false
 
 # 旧形式との互換用:
 # num_candidates = 6
@@ -945,6 +978,17 @@ timeout_ms = 120
         assert!(json.contains(r#""model":"qwen3-0.6b-q8_0""#), "{json}");
         assert!(json.contains(r#""lambda":0.8"#), "{json}");
         assert!(json.contains(r#""timeout_ms":120"#), "{json}");
+    }
+
+    #[test]
+    fn typo_section_is_off_by_default_and_parses_when_present() {
+        let cfg: AppConfig = toml::from_str("[general]\n").expect("parse");
+        assert!(!cfg.typo.log);
+        assert_eq!(cfg.typo.to_engine_json(), r#"{"log":false}"#);
+        let cfg: AppConfig = toml::from_str("[typo]\nlog = true\n").expect("parse");
+        assert!(cfg.typo.log);
+        let cfg: AppConfig = toml::from_str("[rerank]\nmax_reading_chars = 8\n").expect("parse");
+        assert!(cfg.rerank.to_engine_json().contains(r#""max_reading_chars":8"#));
     }
 
     #[test]

@@ -92,3 +92,10 @@ enabled = false
 # threads = 0
 # max_candidates = 6
 # timeout_ms = 150
+# 読みがこれより長いときは並べ替えない（長い読みの候補は LLM の文候補で、同音異義語ではない）
+# max_reading_chars = 12
+
+[typo]
+# 誤入力補正（開発中）。log = true で、Backspace で消して打ち直した打鍵列を
+# %LOCALAPPDATA%\rakukan\typo.log に残す（補正規則の重みを決める計測用。確定した文は書かない）
+log = false

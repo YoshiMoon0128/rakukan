@@ -43,6 +43,8 @@ pub struct RerankConfig {
     pub require_right_context: bool,
     /// 左文脈として使う末尾の文字数
     pub left_chars: usize,
+    /// 読みがこれより長いときは採点しない（呼び元 `merge_candidates_for_reading_with_context` が見る）
+    pub max_reading_chars: usize,
 }
 
 impl Default for RerankConfig {
@@ -54,6 +56,7 @@ impl Default for RerankConfig {
             right_tail_chars: 2,
             require_right_context: false,
             left_chars: 200,
+            max_reading_chars: 12,
         }
     }
 }
@@ -67,6 +70,7 @@ impl From<&RerankSettings> for RerankConfig {
             right_tail_chars: s.right_tail_chars,
             require_right_context: s.require_right_context,
             left_chars: s.left_chars.max(1),
+            max_reading_chars: s.max_reading_chars.max(1),
         }
     }
 }

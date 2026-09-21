@@ -37,6 +37,7 @@ pub mod ffi;
 pub mod segments;
 #[cfg(feature = "rerank")]
 pub mod rerank;
+pub mod typo_log;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
 pub use backend::Backend as RakunBackend;
@@ -261,10 +262,28 @@ pub struct EngineConfig {
     /// feature `rerank` 無しの DLL でも読めるようにここに置く（JSON の互換のため）。
     #[serde(default)]
     pub rerank: RerankSettings,
+    /// 誤入力補正（`config.toml` の `[typo]`）。いまは計測ログの on/off だけ
+    #[serde(default)]
+    pub typo: TypoSettings,
 }
 
 fn default_confidence_margin() -> Option<f32> {
     Some(3.0)
+}
+
+/// `config.toml` の `[typo]`。誤入力補正の設定。第 3 段の spec（ime-rerank）の段取り 1 では
+/// 計測ログだけを持つ。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct TypoSettings {
+    /// Backspace で消して打ち直した打鍵列を `%LOCALAPPDATA%\rakukan\typo.log` に残す。既定 false
+    pub log: bool,
+}
+
+impl Default for TypoSettings {
+    fn default() -> Self {
+        Self { log: false }
+    }
 }
 
 /// `config.toml` の `[rerank]`。TSF が読んで EngineConfig JSON に載せる。
@@ -296,6 +315,8 @@ pub struct RerankSettings {
     pub max_candidates: usize,
     /// 採点をこれ以上待たない。超えたら辞書順のまま出す
     pub timeout_ms: u64,
+    /// 読みがこれより長いときは採点しない。長い読みの候補は jinen の文候補で、辞書由来の同音異義語ではない
+    pub max_reading_chars: usize,
 }
 
 impl Default for RerankSettings {
@@ -313,6 +334,7 @@ impl Default for RerankSettings {
             threads: 0,
             max_candidates: 6,
             timeout_ms: 150,
+            max_reading_chars: 12,
         }
     }
 }
@@ -336,6 +358,7 @@ impl Default for EngineConfig {
             min_top_confidence: None,
             force_inference_failure: false,
             rerank: RerankSettings::default(),
+            typo: TypoSettings::default(),
         }
     }
 }
@@ -670,6 +693,10 @@ pub struct RakunEngine {
     /// `config.rerank.enabled` なら生成時に別スレッドでモデルを読み始める
     #[cfg(feature = "rerank")]
     reranker: Option<rerank::Reranker>,
+    /// 打ち間違いの計測ログ（`[typo] log = true`）。None なら記録しない
+    typo_log: Option<typo_log::TypoLog>,
+    /// 今の composition で最初に Backspace を押した直前の（romaji、かな）。確定時のかなと比べて記録する
+    typo_before: Option<(String, String)>,
     dict_store: Option<DictStore>,
 }
 
@@ -680,6 +707,10 @@ impl RakunEngine {
         #[cfg(not(feature = "rerank"))]
         if config.rerank.enabled {
             tracing::warn!("[rerank] enabled = true but this engine DLL was built without feature \"rerank\"; ignoring");
+        }
+        let typo_log = config.typo.log.then(typo_log::TypoLog::at_default_path);
+        if let Some(l) = &typo_log {
+            info!("typo log enabled: {}", l.path().display());
         }
         Self {
             romaji: RomajiConverter::new(),
@@ -692,7 +723,25 @@ impl RakunEngine {
             committed: String::new(),
             #[cfg(feature = "rerank")]
             reranker,
+            typo_log,
+            typo_before: None,
             dict_store: None,
+        }
+    }
+
+    /// 打ち間違いの計測ログを差し替える（None で止める）。テストと CLI 用。
+    pub fn set_typo_log(&mut self, log: Option<typo_log::TypoLog>) {
+        self.typo_log = log;
+    }
+
+    /// 確定時に呼ぶ。Backspace で消して打ち直した結果、かなが変わっていたら記録する。
+    /// romaji は Backspace で書き換わる（再生用の列）ので、書くかどうかはかなで決める。
+    fn flush_typo_log(&mut self) {
+        let Some((before, before_kana)) = self.typo_before.take() else { return };
+        let Some(log) = &self.typo_log else { return };
+        let after_kana = self.hiragana_buf.clone();
+        if !after_kana.is_empty() && before_kana != after_kana {
+            log.record(&before, &self.romaji_log_str(), &before_kana, &after_kana);
         }
     }
 
@@ -930,6 +979,9 @@ impl RakunEngine {
     }
 
     pub fn backspace(&mut self) -> bool {
+        if self.typo_log.is_some() && self.typo_before.is_none() {
+            self.typo_before = Some((self.romaji_log_str(), self.hiragana_buf.clone()));
+        }
         if !self.pending_romaji_buf.is_empty() {
             if self.replay_backspace() {
                 return true;
@@ -1139,6 +1191,7 @@ impl RakunEngine {
 
     pub fn commit(&mut self, text: &str) {
         info!("engine::commit: {:?}", text);
+        self.flush_typo_log();
         if is_context_echo_risk(text) {
             // 未変換のまま確定されたひらがな文を context に入れると、同じ読みの
             // 変換で LLM がコピー（エコー）に収束する（v0.9.15 のエコーアトラクタ）。
@@ -1348,16 +1401,17 @@ impl RakunEngine {
         );
         // 同音異義語リランカー: 学習・ユーザー辞書由来を固定し、辞書・LLM 由来を左右の文脈で並べ替える。
         // 左文脈は TSF がアプリから読んだものを優先し、無ければこの IME で確定した文（committed）
+        // 読みが長いときは採点しない（候補は jinen の文候補で、辞書由来の同音異義語ではない）
         #[cfg(feature = "rerank")]
         let merged = match &self.reranker {
-            Some(rr) => {
+            Some(rr) if hiragana.chars().count() <= rr.config().max_reading_chars => {
                 let left = match left_context {
                     Some(l) if !l.is_empty() => l,
                     _ => self.committed.as_str(),
                 };
                 rr.rerank(left, right_context, merged, &learn_cands, &user_cands)
             }
-            None => merged,
+            _ => merged,
         };
         let mut merged = place_symbol_candidates(merged, symbol_cands, emoji_cands);
 
@@ -1485,6 +1539,7 @@ impl RakunEngine {
     }
 
     pub fn reset_preedit(&mut self) {
+        self.typo_before = None;
         self.hiragana_buf.clear();
         self.romaji = RomajiConverter::new();
         self.pending_romaji_buf.clear();
@@ -1492,6 +1547,7 @@ impl RakunEngine {
     }
 
     pub fn reset_all(&mut self) {
+        self.typo_before = None;
         self.hiragana_buf.clear();
         self.committed.clear();
         self.romaji = RomajiConverter::new();
@@ -2944,5 +3000,101 @@ mod rerank_settings_tests {
         );
         assert_eq!(plain, with_ctx);
         assert!(!e.is_reranker_ready());
+    }
+}
+
+#[cfg(test)]
+mod typo_log_tests {
+    //! 打ち間違いの計測ログ（`[typo] log`）。Backspace で消して打ち直した打鍵列だけを記録する。
+    use super::*;
+
+    fn type_all(e: &mut RakunEngine, s: &str) {
+        for c in s.chars() {
+            e.push_char(c);
+        }
+    }
+
+    fn engine_with_log(dir: &std::path::Path) -> RakunEngine {
+        let mut e = RakunEngine::new(EngineConfig::default());
+        e.set_typo_log(Some(typo_log::TypoLog::new(dir.join("typo.log"))));
+        e
+    }
+
+    #[test]
+    fn 消して打ち直して確定すると消す前と確定時の打鍵列が残る() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with_log(dir.path());
+        type_all(&mut e, "kannnijiya");
+        assert_eq!(e.hiragana_text(), "かんにじや");
+        for _ in 0..3 {
+            e.backspace();
+        }
+        type_all(&mut e, "jiniya");
+        assert_eq!(e.hiragana_text(), "かんじにや");
+        e.commit("感じにや");
+        let text = std::fs::read_to_string(dir.path().join("typo.log")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(r#""before":"kannnijiya""#), "{text}");
+        assert!(text.contains(r#""before_kana":"かんにじや","after_kana":"かんじにや""#), "{text}");
+    }
+
+    #[test]
+    fn 打ち直しが無ければ何も書かない() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with_log(dir.path());
+        type_all(&mut e, "kanji");
+        e.commit("漢字");
+        // Backspace で消して同じ列を打ち直した場合も、間違いではないので書かない
+        type_all(&mut e, "kanji");
+        e.backspace();
+        type_all(&mut e, "ji");
+        e.commit("漢字");
+        assert!(!dir.path().join("typo.log").exists());
+    }
+
+    #[test]
+    fn 既定では記録しない() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = RakunEngine::new(EngineConfig::default());
+        let _ = dir;
+        type_all(&mut e, "abc");
+        e.backspace();
+        type_all(&mut e, "d");
+        e.commit("x");
+        assert!(e.typo_log.is_none());
+    }
+}
+
+#[cfg(all(test, feature = "rerank"))]
+mod rerank_reading_gate_tests {
+    //! 読みの長さの門: 長い読み（jinen の文候補）は採点しない。
+    use super::*;
+    use std::time::Duration;
+
+    /// 2 番目を常に最良にする偽の採点器
+    struct Second;
+    impl rerank::ScoreBackend for Second {
+        fn score(&mut self, _l: &str, _r: Option<&str>, c: &[String]) -> Result<Vec<f32>, String> {
+            Ok((0..c.len()).map(|i| if i == 1 { -1.0 } else { -10.0 }).collect())
+        }
+    }
+
+    fn engine_with_fake(max_reading_chars: usize) -> RakunEngine {
+        let mut e = RakunEngine::new(EngineConfig::default());
+        let cfg = rerank::RerankConfig { max_reading_chars, ..rerank::RerankConfig::default() };
+        let rr = rerank::Reranker::spawn(cfg, Duration::from_secs(1), || Ok(Box::new(Second)));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+        e.set_reranker(Some(rr));
+        e
+    }
+
+    #[test]
+    fn 読みが上限以下なら採点し上限を超えたら辞書順のまま() {
+        let e = engine_with_fake(5);
+        let cands = || vec!["機械".to_string(), "機会".to_string()];
+        let short = e.merge_candidates_for_reading_with_context("きかい", cands(), 6, Some("次の"), None);
+        assert_eq!(short[0], "機会");
+        let long = e.merge_candidates_for_reading_with_context("きかいをまつしかない", cands(), 6, Some("次の"), None);
+        assert_eq!(long[0], "機械");
     }
 }
