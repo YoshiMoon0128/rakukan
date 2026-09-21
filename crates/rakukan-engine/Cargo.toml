@@ -20,7 +20,7 @@ serde_json     = { workspace = true }
 which          = { workspace = true }
 
 # 旧 karukan-engine の依存をそのまま引き継ぐ
-llama-cpp-2           = "0.1"
+llama-cpp-2           = { version = "0.1", default-features = false, features = ["common"] }
 yada                  = "0.5"
 hf-hub                = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 unicode-normalization  = "0.1"
