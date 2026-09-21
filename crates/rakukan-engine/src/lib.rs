@@ -1311,6 +1311,11 @@ impl RakunEngine {
         self.reranker = reranker;
     }
 
+    /// jinen（漢字変換 LLM）が使える状態か。engine が持っているか、BG 変換に貸し出し中かのどちらか。
+    fn llm_available(&self) -> bool {
+        self.kanji.is_some() || conv_cache::has_converter()
+    }
+
     /// リランカーが載っていて採点できる状態か（feature off なら常に false）。
     pub fn is_reranker_ready(&self) -> bool {
         #[cfg(feature = "rerank")]
@@ -1395,6 +1400,7 @@ impl RakunEngine {
             llm_candidates
         );
 
+        let llm_empty = llm_candidates.is_empty();
         let merged = merge_candidate_lists(
             &learn_cands,
             &user_cands,
@@ -1404,10 +1410,16 @@ impl RakunEngine {
         );
         // 同音異義語リランカー: 学習・ユーザー辞書由来を固定し、辞書・LLM 由来を左右の文脈で並べ替える。
         // 左文脈は TSF がアプリから読んだものを優先し、無ければこの IME で確定した文（committed）
-        // 読みが長いときは採点しない（候補は jinen の文候補で、辞書由来の同音異義語ではない）
+        // 読みが長いときは採点しない（候補は jinen の文候補で、辞書由来の同音異義語ではない）。
+        // 並べ替えは jinen の候補が揃った最終マージで 1 回だけ。Space 直後の辞書だけの即時表示（llm 空）で
+        // 採点すると表示が 6 ms → 250 ms に遅れ、しかも直後の最終マージで採点し直す（実機で観測）。
+        // jinen が使えない（ロード前・失敗）ときは辞書だけのマージが最終なので、そこで並べ替える
         #[cfg(feature = "rerank")]
         let merged = match &self.reranker {
-            Some(rr) if hiragana.chars().count() <= rr.config().max_reading_chars => {
+            Some(rr)
+                if hiragana.chars().count() <= rr.config().max_reading_chars
+                    && should_rerank_now(llm_empty, self.llm_available()) =>
+            {
                 let left = match left_context {
                     Some(l) if !l.is_empty() => l,
                     _ => self.committed.as_str(),
@@ -1574,6 +1586,13 @@ impl RakunEngine {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
+}
+
+/// このマージで並べ替えるか。`llm_empty` は LLM 候補が空（辞書だけのマージ）、`llm_available` は jinen が使える状態。
+/// jinen が使えるなら辞書だけのマージは Space 直後の即時表示で、直後に LLM 候補を含む最終マージが来るので
+/// そちらで 1 回だけ採点する。jinen が使えないなら辞書だけのマージが最終なので採点する。
+pub fn should_rerank_now(llm_empty: bool, llm_available: bool) -> bool {
+    !(llm_empty && llm_available)
 }
 
 fn compiled_backend_label() -> &'static str {
@@ -3110,5 +3129,23 @@ mod rerank_reading_gate_tests {
         assert_eq!(short[0], "機会");
         let long = e.merge_candidates_for_reading_with_context("きかいをまつしかない", cands(), 6, Some("次の"), None);
         assert_eq!(long[0], "機械");
+    }
+}
+
+#[cfg(test)]
+mod rerank_timing_policy_tests {
+    //! 並べ替えは jinen の候補が揃った最終マージで 1 回だけ。
+    use super::should_rerank_now;
+
+    #[test]
+    fn jinen_が使えるなら辞書だけの即時マージでは採点せず_llm候補付きの最終マージで採点する() {
+        assert!(!should_rerank_now(true, true));
+        assert!(should_rerank_now(false, true));
+    }
+
+    #[test]
+    fn jinen_が使えないなら辞書だけのマージが最終なので採点する() {
+        assert!(should_rerank_now(true, false));
+        assert!(should_rerank_now(false, false));
     }
 }
