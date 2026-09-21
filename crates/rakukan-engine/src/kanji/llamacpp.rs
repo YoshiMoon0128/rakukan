@@ -28,8 +28,9 @@ static LLAMA_BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = Once
 /// その場合は TSF 側のウォッチドッグ (bg_timeout_watchdog) が engine_reload で対処する。
 const GEN_TIMEOUT_SECS: u64 = 15;
 
-/// Get or initialize the global llama.cpp backend
-fn get_backend() -> Result<&'static LlamaBackend> {
+/// Get or initialize the global llama.cpp backend.
+/// `rerank` も同じ backend を使う（`LlamaBackend::init` はプロセスで 1 回しか成功しない）。
+pub(crate) fn get_backend() -> Result<&'static LlamaBackend> {
     let result = LLAMA_BACKEND.get_or_init(|| {
         let mut backend = LlamaBackend::init().map_err(|e| e.to_string())?;
         backend.void_logs();

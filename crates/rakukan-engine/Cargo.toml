@@ -22,7 +22,7 @@ which          = { workspace = true }
 # 旧 karukan-engine の依存をそのまま引き継ぐ
 llama-cpp-2           = "0.1"
 yada                  = "0.5"
-hf-hub                = "0.4"
+hf-hub                = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 unicode-normalization  = "0.1"
 memmap2               = "0.9"
 tokenizers            = "0.21"
@@ -36,6 +36,8 @@ rakukan-dict   = { path = "../rakukan-dict" }
 tempfile = { workspace = true }
 
 [features]
+# 同音異義語リランカー（辞書候補を小型 LM の対数尤度で並べ替える）。既定 off
+rerank = []
 # GPU バックエンド（llama-cpp-2 の feature を通じて有効化）
 cuda   = ["llama-cpp-2/cuda"]
 vulkan = ["llama-cpp-2/vulkan"]

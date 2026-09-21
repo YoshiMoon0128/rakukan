@@ -35,6 +35,8 @@ pub mod dict;
 pub mod digits;
 pub mod ffi;
 pub mod segments;
+#[cfg(feature = "rerank")]
+pub mod rerank;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
 pub use backend::Backend as RakunBackend;
@@ -255,10 +257,64 @@ pub struct EngineConfig {
     /// 診断用: 推論を必ず失敗させる（既定 false）。Issue #43 の復帰段階の確認用。
     #[serde(default)]
     pub force_inference_failure: bool,
+    /// 同音異義語リランカー（`config.toml` の `[rerank]`）。既定 off。
+    /// feature `rerank` 無しの DLL でも読めるようにここに置く（JSON の互換のため）。
+    #[serde(default)]
+    pub rerank: RerankSettings,
 }
 
 fn default_confidence_margin() -> Option<f32> {
     Some(3.0)
+}
+
+/// `config.toml` の `[rerank]`。TSF が読んで EngineConfig JSON に載せる。
+/// 並べ替えの中身は `rerank` モジュール（feature = "rerank"）、ここは設定の運び役。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct RerankSettings {
+    /// 並べ替えを使うか。既定 false で、rakukan の既存挙動を変えない
+    pub enabled: bool,
+    /// リランカーの GGUF の ID。`qwen3-1.7b-q8_0`（既定）か `qwen3-0.6b-q8_0`
+    pub model: String,
+    /// GGUF のパスを直接指定する（`model` より優先）。試験用
+    pub model_path: Option<String>,
+    /// 辞書順の事前分布との混合比。1.0 で LM だけ。0.6B のときは 0.8
+    pub lambda: f32,
+    /// 事前分布の減衰。`log_prior(r) = r · ln(rho)`
+    pub rho: f32,
+    /// true なら右文脈が取れた場面だけ並べ替える。0.6B では true にする
+    pub require_right_context: bool,
+    /// TSF がアプリから読む左文脈の文字数。engine 側でも左文脈をこの長さに刈る
+    pub left_chars: usize,
+    /// TSF がアプリから読む右文脈の文字数
+    pub right_chars: usize,
+    /// 右文脈のうち候補の後ろに付けて採点する文字数。2 で十分（1.7B の遅延を 150 → 106 ms に下げる）
+    pub right_tail_chars: usize,
+    /// 採点に使うスレッド数。0 = 自動（論理コア数、上限 8）
+    pub threads: u32,
+    /// 並べ替えの対象にする候補数の上限
+    pub max_candidates: usize,
+    /// 採点をこれ以上待たない。超えたら辞書順のまま出す
+    pub timeout_ms: u64,
+}
+
+impl Default for RerankSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "qwen3-1.7b-q8_0".into(),
+            model_path: None,
+            lambda: 1.0,
+            rho: 0.5,
+            require_right_context: false,
+            left_chars: 200,
+            right_chars: 20,
+            right_tail_chars: 2,
+            threads: 0,
+            max_candidates: 6,
+            timeout_ms: 150,
+        }
+    }
 }
 
 impl Default for EngineConfig {
@@ -279,6 +335,7 @@ impl Default for EngineConfig {
             confidence_margin: default_confidence_margin(),
             min_top_confidence: None,
             force_inference_failure: false,
+            rerank: RerankSettings::default(),
         }
     }
 }
@@ -609,11 +666,21 @@ pub struct RakunEngine {
     /// log をクリアしたら 0 に戻す。
     log_detached_at: usize,
     committed: String,
+    /// 同音異義語リランカー（feature = "rerank"）。None なら並べ替えない。
+    /// `config.rerank.enabled` なら生成時に別スレッドでモデルを読み始める
+    #[cfg(feature = "rerank")]
+    reranker: Option<rerank::Reranker>,
     dict_store: Option<DictStore>,
 }
 
 impl RakunEngine {
     pub fn new(config: EngineConfig) -> Self {
+        #[cfg(feature = "rerank")]
+        let reranker = rerank::Reranker::from_settings(&config.rerank);
+        #[cfg(not(feature = "rerank"))]
+        if config.rerank.enabled {
+            tracing::warn!("[rerank] enabled = true but this engine DLL was built without feature \"rerank\"; ignoring");
+        }
         Self {
             romaji: RomajiConverter::new(),
             kanji: None,
@@ -623,6 +690,8 @@ impl RakunEngine {
             input_log: Vec::new(),
             log_detached_at: 0,
             committed: String::new(),
+            #[cfg(feature = "rerank")]
+            reranker,
             dict_store: None,
         }
     }
@@ -1180,12 +1249,49 @@ impl RakunEngine {
         self.dict_store.as_ref()
     }
 
+    /// 同音異義語リランカーを差し替える（None で外す）。通常は `config.rerank` から生成時に載る。
+    #[cfg(feature = "rerank")]
+    pub fn set_reranker(&mut self, reranker: Option<rerank::Reranker>) {
+        self.reranker = reranker;
+    }
+
+    /// リランカーが載っていて採点できる状態か（feature off なら常に false）。
+    pub fn is_reranker_ready(&self) -> bool {
+        #[cfg(feature = "rerank")]
+        {
+            self.reranker.as_ref().is_some_and(|r| r.is_ready())
+        }
+        #[cfg(not(feature = "rerank"))]
+        {
+            false
+        }
+    }
+
     pub fn merge_candidates_for_reading(
         &self,
         hiragana: &str,
         llm_candidates: Vec<String>,
         limit: usize,
     ) -> Vec<String> {
+        self.merge_candidates_for_reading_with_context(hiragana, llm_candidates, limit, None, None)
+    }
+
+    /// `merge_candidates_for_reading` に、TSF がアプリから読んだ左右の文脈を添える版。
+    ///
+    /// `left_context` は composition 直前のテキスト。None または空なら engine の `committed`
+    /// （この IME で確定した文）を使う。`right_context` は composition 直後のテキストで、
+    /// 取れない場面は None。リランカーが無い・ロード前・feature off なら文脈は使わず、
+    /// 結果は `merge_candidates_for_reading` と同じ。
+    pub fn merge_candidates_for_reading_with_context(
+        &self,
+        hiragana: &str,
+        llm_candidates: Vec<String>,
+        limit: usize,
+        left_context: Option<&str>,
+        right_context: Option<&str>,
+    ) -> Vec<String> {
+        #[cfg(not(feature = "rerank"))]
+        let _ = (left_context, right_context);
         // 優先順位（Step 12-1、Issue #13 / #37）: 学習履歴 → ユーザー辞書 → システム辞書 → LLM
         // 学習履歴を先頭に置くので、ユーザー辞書の表記を別の候補で上書きできる。
         // LLM は末尾だが、辞書候補が上限まで埋めても LLM の枠は確保する（#42 の 4）。
@@ -1240,6 +1346,19 @@ impl RakunEngine {
             llm_candidates,
             limit,
         );
+        // 同音異義語リランカー: 学習・ユーザー辞書由来を固定し、辞書・LLM 由来を左右の文脈で並べ替える。
+        // 左文脈は TSF がアプリから読んだものを優先し、無ければこの IME で確定した文（committed）
+        #[cfg(feature = "rerank")]
+        let merged = match &self.reranker {
+            Some(rr) => {
+                let left = match left_context {
+                    Some(l) if !l.is_empty() => l,
+                    _ => self.committed.as_str(),
+                };
+                rr.rerank(left, right_context, merged, &learn_cands, &user_cands)
+            }
+            None => merged,
+        };
         let mut merged = place_symbol_candidates(merged, symbol_cands, emoji_cands);
 
         // 候補不足時は元の読みを末尾に追加（変換せず確定する退避路）
@@ -2784,5 +2903,46 @@ mod log_rewrite_tests {
             assert_eq!(e.hiragana_from_romaji_log(), e.hiragana_text());
         }
         assert_eq!(e.current_preedit().display(), "");
+    }
+}
+
+#[cfg(test)]
+mod rerank_settings_tests {
+    //! `[rerank]` の運び役（`RerankSettings`）と、文脈付きマージの既定挙動。
+    use super::*;
+
+    #[test]
+    fn rerank_を含まない旧形式の_config_json_は既定_off_で読める() {
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"num_candidates":5,"n_threads":0}"#).expect("parse");
+        assert!(!cfg.rerank.enabled);
+        assert_eq!(cfg.rerank, RerankSettings::default());
+    }
+
+    #[test]
+    fn rerank_の一部のキーだけ書いた_json_は残りが既定値になる() {
+        let cfg: EngineConfig = serde_json::from_str(
+            r#"{"num_candidates":5,"n_threads":0,"rerank":{"enabled":true,"model":"qwen3-0.6b-q8_0","lambda":0.8}}"#,
+        )
+        .expect("parse");
+        assert!(cfg.rerank.enabled);
+        assert_eq!(cfg.rerank.model, "qwen3-0.6b-q8_0");
+        assert_eq!(cfg.rerank.lambda, 0.8);
+        assert_eq!(cfg.rerank.timeout_ms, RerankSettings::default().timeout_ms);
+    }
+
+    #[test]
+    fn リランカーが無いエンジンでは文脈を添えてもマージ結果は同じ() {
+        let e = RakunEngine::new(EngineConfig::default());
+        let plain = e.merge_candidates_for_reading("きかい", vec!["機械".into(), "機会".into()], 5);
+        let with_ctx = e.merge_candidates_for_reading_with_context(
+            "きかい",
+            vec!["機械".into(), "機会".into()],
+            5,
+            Some("次の"),
+            Some("を待つ"),
+        );
+        assert_eq!(plain, with_ctx);
+        assert!(!e.is_reranker_ready());
     }
 }
