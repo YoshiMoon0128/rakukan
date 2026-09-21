@@ -142,14 +142,89 @@ fn layout() -> Layout {
 /// キャレット高さの推定値（画面端反転時に使用）
 const CARET_HEIGHT_ESTIMATE: i32 = 24;
 
-/// 選択行のハイライト色（濃い青）
-const COLOR_SEL_BG: COLORREF = COLORREF(0x00_B4_4E_20); // #204EB4 → BGR
-/// 選択行のテキスト色（白）
-const COLOR_SEL_FG: COLORREF = COLORREF(0x00_FF_FF_FF);
-/// 通常行の背景色（白）
-const COLOR_BG: COLORREF = COLORREF(0x00_FF_FF_FF);
-/// 通常行のテキスト色（黒）
-const COLOR_FG: COLORREF = COLORREF(0x00_00_00_00);
+/// 候補ウィンドウの配色。COLORREF は 0x00BBGGRR。
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: COLORREF,
+    fg: COLORREF,
+    /// 行番号（候補より薄く）
+    num: COLORREF,
+    sel_bg: COLORREF,
+    sel_fg: COLORREF,
+    /// 選択行の左端の細い帯（MS-IME 風）
+    accent: COLORREF,
+    border: COLORREF,
+    pager_bg: COLORREF,
+    pager_fg: COLORREF,
+    status_bg: COLORREF,
+    status_fg: COLORREF,
+}
+
+const PALETTE_LIGHT: Palette = Palette {
+    bg: COLORREF(0x00_FF_FF_FF),
+    fg: COLORREF(0x00_1F_1F_1F),
+    num: COLORREF(0x00_70_70_70),
+    sel_bg: COLORREF(0x00_E8_E8_E8),
+    sel_fg: COLORREF(0x00_00_00_00),
+    accent: COLORREF(0x00_8A_4D_E8), // #E84D8A
+    border: COLORREF(0x00_C8_C8_C8),
+    pager_bg: COLORREF(0x00_F0_F0_F0),
+    pager_fg: COLORREF(0x00_55_55_55),
+    status_bg: COLORREF(0x00_F8_F8_F8),
+    status_fg: COLORREF(0x00_88_88_88),
+};
+
+const PALETTE_DARK: Palette = Palette {
+    bg: COLORREF(0x00_2B_2B_2B),
+    fg: COLORREF(0x00_F0_F0_F0),
+    num: COLORREF(0x00_9A_9A_9A),
+    sel_bg: COLORREF(0x00_3F_3F_3F),
+    sel_fg: COLORREF(0x00_FF_FF_FF),
+    accent: COLORREF(0x00_8A_4D_E8),
+    border: COLORREF(0x00_4A_4A_4A),
+    pager_bg: COLORREF(0x00_33_33_33),
+    pager_fg: COLORREF(0x00_C0_C0_C0),
+    status_bg: COLORREF(0x00_30_30_30),
+    status_fg: COLORREF(0x00_A0_A0_A0),
+};
+
+/// 表示 1 回分の見た目（配色と書体）。`show_with_status()` の開始時に設定から写し、`draw()` はこれだけを見る。
+#[derive(Clone)]
+struct Style {
+    palette: Palette,
+    font_face: String,
+}
+
+thread_local! {
+    static TL_STYLE: std::cell::RefCell<Style> = std::cell::RefCell::new(Style { palette: PALETTE_LIGHT, font_face: "Meiryo UI".to_string() });
+}
+
+/// 設定名から配色を決める。"system" は Windows のテーマ（ライト/ダーク）に追従する。
+fn palette_for(theme: &str) -> Palette {
+    match theme {
+        "dark" => PALETTE_DARK,
+        "system" => {
+            if crate::tsf::language_bar::is_light_mode() {
+                PALETTE_LIGHT
+            } else {
+                PALETTE_DARK
+            }
+        }
+        _ => PALETTE_LIGHT,
+    }
+}
+
+fn snapshot_style() {
+    let (theme, face) = crate::engine::config::candidate_style();
+    let face = if face.trim().is_empty() { "Meiryo UI".to_string() } else { face };
+    TL_STYLE.with(|s| {
+        *s.borrow_mut() = Style { palette: palette_for(theme.trim()), font_face: face };
+    });
+}
+
+fn style() -> Style {
+    TL_STYLE.with(|s| s.borrow().clone())
+}
 
 // ─── スレッドローカル状態 ──────────────────────────────────────────────────────
 
@@ -458,9 +533,11 @@ unsafe fn draw(hdc: HDC) {
     let has_status = data.status_line.is_some();
     let win_h = lay.window_height(n, has_pager, has_status);
     let win_width = TL_WIN_WIDTH.with(|c| c.get());
+    let st = style();
+    let pal = st.palette;
 
-    // 背景を白で塗りつぶし
-    let bg_brush = CreateSolidBrush(COLOR_BG);
+    // 背景
+    let bg_brush = CreateSolidBrush(pal.bg);
     let full = RECT {
         left: 0,
         top: 0,
@@ -470,8 +547,8 @@ unsafe fn draw(hdc: HDC) {
     FillRect(hdc, &full, bg_brush);
     let _ = DeleteObject(bg_brush);
 
-    // フォント
-    let face: Vec<u16> = "Meiryo UI\0".encode_utf16().collect();
+    // フォント（書体は設定。無ければ Meiryo UI）
+    let face: Vec<u16> = st.font_face.encode_utf16().chain(std::iter::once(0)).collect();
     let font = CreateFontW(
         lay.font_height,
         0,
@@ -491,10 +568,11 @@ unsafe fn draw(hdc: HDC) {
     let old_obj = SelectObject(hdc, font);
     SetBkMode(hdc, BACKGROUND_MODE(1)); // TRANSPARENT
 
-    let sel_brush = CreateSolidBrush(COLOR_SEL_BG);
-    let wht_brush = CreateSolidBrush(COLOR_BG);
-    let pager_brush = CreateSolidBrush(COLORREF(0x00_F0_F0_F0));
-    let status_brush = CreateSolidBrush(COLORREF(0x00_F8_F8_F8));
+    let sel_brush = CreateSolidBrush(pal.sel_bg);
+    let wht_brush = CreateSolidBrush(pal.bg);
+    let accent_brush = CreateSolidBrush(pal.accent);
+    let pager_brush = CreateSolidBrush(pal.pager_bg);
+    let status_brush = CreateSolidBrush(pal.status_bg);
 
     // ステータス行（先頭・グレー背景・番号なし・選択不可）
     let status_offset = if has_status {
@@ -506,7 +584,7 @@ unsafe fn draw(hdc: HDC) {
                 bottom: lay.padding_y + lay.status_height,
             };
             FillRect(hdc, &row, status_brush);
-            SetTextColor(hdc, COLORREF(0x00_88_88_88));
+            SetTextColor(hdc, pal.status_fg);
             let text_w: Vec<u16> = s.encode_utf16().collect();
             let _ = TextOutW(
                 hdc,
@@ -531,15 +609,26 @@ unsafe fn draw(hdc: HDC) {
         };
         let is_sel = i == data.selected;
         FillRect(hdc, &row, if is_sel { sel_brush } else { wht_brush });
-        SetTextColor(hdc, if is_sel { COLOR_SEL_FG } else { COLOR_FG });
-        let text = format!("{} {}", i + 1, cand);
-        let text_w: Vec<u16> = text.encode_utf16().collect();
-        let _ = TextOutW(
-            hdc,
-            lay.padding_x,
-            y + (lay.item_height - lay.font_height) / 2,
-            &text_w,
-        );
+        if is_sel {
+            // 選択行は薄い帯 + 左端の細いアクセント（MS-IME 風）。ベタ塗りの青はやめた
+            let bar = RECT {
+                left: 0,
+                top: y + lay.item_height / 5,
+                right: scaled_to(3, lay.font_height).max(2),
+                bottom: y + lay.item_height - lay.item_height / 5,
+            };
+            FillRect(hdc, &bar, accent_brush);
+        }
+        // 番号は薄く、候補は濃く。幅の計測（compute_needed_width）は "{n} {cand}" 全体で測っているので位置は変えない
+        let ty = y + (lay.item_height - lay.font_height) / 2;
+        let num_text: Vec<u16> = format!("{} ", i + 1).encode_utf16().collect();
+        SetTextColor(hdc, if is_sel { pal.sel_fg } else { pal.num });
+        let _ = TextOutW(hdc, lay.padding_x, ty, &num_text);
+        let mut num_size = windows::Win32::Foundation::SIZE::default();
+        let _ = windows::Win32::Graphics::Gdi::GetTextExtentPoint32W(hdc, &num_text, &mut num_size);
+        SetTextColor(hdc, if is_sel { pal.sel_fg } else { pal.fg });
+        let cand_w: Vec<u16> = cand.encode_utf16().collect();
+        let _ = TextOutW(hdc, lay.padding_x + num_size.cx, ty, &cand_w);
     }
 
     // ページインジケーター行（複数ページがある場合のみ）
@@ -552,9 +641,7 @@ unsafe fn draw(hdc: HDC) {
             bottom: y + lay.pager_height,
         };
         FillRect(hdc, &row, pager_brush);
-        let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, 0, y, None);
-        let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, win_width, y);
-        SetTextColor(hdc, COLORREF(0x00_55_55_55));
+        SetTextColor(hdc, pal.pager_fg);
         let pager_text = format!("◀  {}  ▶", data.page_info);
         let pager_w: Vec<u16> = pager_text.encode_utf16().collect();
         let _ = TextOutW(
@@ -565,8 +652,14 @@ unsafe fn draw(hdc: HDC) {
         );
     }
 
+    // 枠線（WS_BORDER をやめて角丸にしたので自前で 1px）
+    let border_brush = CreateSolidBrush(pal.border);
+    let _ = windows::Win32::Graphics::Gdi::FrameRect(hdc, &full, border_brush);
+    let _ = DeleteObject(border_brush);
+
     let _ = DeleteObject(sel_brush);
     let _ = DeleteObject(wht_brush);
+    let _ = DeleteObject(accent_brush);
     let _ = DeleteObject(pager_brush);
     let _ = DeleteObject(status_brush);
     SelectObject(hdc, old_obj);
@@ -689,6 +782,8 @@ pub fn show_with_status(
     // 受け取れなかったプロセスでも最新のフォントサイズを拾えるよう、
     // 表示のたびに config.toml の mtime を確認して appearance だけ更新する。
     crate::engine::config::refresh_appearance_if_changed();
+    // 配色と書体も同じタイミングで写す（描画パスでは設定を読まない）
+    snapshot_style();
 
     // ここでレイアウトを 1 回だけ確定させ、以降の描画・幅計測・再配置は
     // すべてこのスナップショットを使う。表示中に設定が変わっても寸法は
@@ -732,7 +827,7 @@ pub fn show_with_status(
                 WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 PCWSTR(CLASS_NAME_UTF16.as_ptr()),
                 PCWSTR::null(),
-                WS_POPUP | WS_BORDER,
+                WS_POPUP,
                 win_x,
                 win_y,
                 win_width,
@@ -744,8 +839,21 @@ pub fn show_with_status(
             ) {
                 Ok(new_hwnd) if is_valid(new_hwnd) => {
                     set_hwnd(new_hwnd);
+                    // Windows 11 の角丸（MS-IME と同じ）。Windows 10 では失敗するので無視する。枠線は draw() が引く
+                    {
+                        use windows::Win32::Graphics::Dwm::{
+                            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+                        };
+                        let pref = DWMWCP_ROUND;
+                        let _ = DwmSetWindowAttribute(
+                            new_hwnd,
+                            DWMWA_WINDOW_CORNER_PREFERENCE,
+                            &pref as *const _ as *const core::ffi::c_void,
+                            std::mem::size_of_val(&pref) as u32,
+                        );
+                    }
                     let _ = ShowWindow(new_hwnd, SW_SHOWNOACTIVATE);
-                    tracing::debug!("candwin::create: hwnd={:?}", new_hwnd);
+                    tracing::debug!("candwin::create: hwnd={:?} corners=round", new_hwnd);
                 }
                 Ok(_) | Err(_) => tracing::warn!("candwin::create: failed"),
             }

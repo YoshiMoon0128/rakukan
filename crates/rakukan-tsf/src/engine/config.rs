@@ -184,6 +184,12 @@ fn json_number(x: f32) -> String {
 pub struct AppearanceConfig {
     #[serde(default = "default_candidate_font_height")]
     pub candidate_font_height: i32,
+    /// 候補ウィンドウの配色: "light"（従来の白）/ "dark" / "system"（Windows のテーマに追従）
+    #[serde(default = "default_candidate_theme")]
+    pub candidate_theme: String,
+    /// 候補ウィンドウの書体。既定は Meiryo UI。MS-IME に寄せるなら "Yu Gothic UI"
+    #[serde(default = "default_candidate_font_face")]
+    pub candidate_font_face: String,
 }
 
 /// 既定のフォント高さ。candidate_window.rs のレイアウト定数はこの値を基準に決めてある。
@@ -193,12 +199,33 @@ fn default_candidate_font_height() -> i32 {
     DEFAULT_CANDIDATE_FONT_HEIGHT
 }
 
+fn default_candidate_theme() -> String {
+    "light".to_string()
+}
+
+fn default_candidate_font_face() -> String {
+    "Meiryo UI".to_string()
+}
+
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
             candidate_font_height: default_candidate_font_height(),
+            candidate_theme: default_candidate_theme(),
+            candidate_font_face: default_candidate_font_face(),
         }
     }
+}
+
+/// 候補ウィンドウの配色名と書体。表示 1 回につき 1 回だけ読む（描画パスからは呼ばない）。
+pub fn candidate_style() -> (String, String) {
+    let cfg = current_config();
+    (cfg.appearance.candidate_theme.clone(), cfg.appearance.candidate_font_face.clone())
+}
+
+/// Space 変換で jinen を同期で待つ上限（ミリ秒）。`[conversion] inline_wait_ms`。
+pub fn conversion_inline_wait_ms() -> u64 {
+    current_config().conversion.inline_wait_ms.min(1000)
 }
 
 impl AppConfig {
@@ -490,6 +517,12 @@ pub struct ConversionConfig {
     /// 新形式では `[conversion].num_candidates` に保存する。
     #[serde(default)]
     pub num_candidates: Option<usize>,
+    /// Space を押してから jinen の候補を**同期で**待つ上限（ミリ秒、既定 0 = 待たない）。
+    /// 0 だと辞書候補を即時に出してから jinen の結果で差し替える（表示が 2 回変わる）。
+    /// 60〜100 にすると短い読み（jinen 40〜60 ms）は 1 回で最終の並びが出る。
+    /// 間に合わなければ従来どおり即時表示 + 差し替えに落ちる。上限 1000
+    #[serde(default)]
+    pub inline_wait_ms: u64,
 }
 
 impl Default for ConversionConfig {
@@ -497,6 +530,7 @@ impl Default for ConversionConfig {
         Self {
             beam_size: default_convert_beam_size(),
             num_candidates: None,
+            inline_wait_ms: 0,
         }
     }
 }
@@ -852,11 +886,20 @@ beam_size = 6
 # 新形式は [conversion].num_candidates。旧形式のルート直下 num_candidates も引き続き読める。
 # num_candidates = 6
 
+# Space を押してから jinen の候補を同期で待つ上限（ミリ秒、既定 0 = 待たない）。
+# 0 だと辞書候補を即時に出してから jinen の結果で差し替える（表示が 2 回変わる）。
+# 60〜100 にすると短い読みは 1 回で最終の並びが出る。間に合わなければ従来どおり。
+# inline_wait_ms = 0
+
 [appearance]
 # 候補ウィンドウのフォントサイズ（ピクセル）。既定 17
 # 行の高さ・余白・最小幅も同じ比率で拡大するので、この値だけ変えればよい。
 # 10〜72 にクランプされる。次回の候補表示から反映。
 candidate_font_height = 17
+# 配色: "light"（既定・白）/ "dark" / "system"（Windows のテーマに追従）
+# candidate_theme = "light"
+# 書体。MS-IME に寄せるなら "Yu Gothic UI"
+# candidate_font_face = "Meiryo UI"
 
 [diagnostics]
 dump_active_config = false

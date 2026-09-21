@@ -419,6 +419,10 @@ impl super::TextServiceFactory_Impl {
                     self.on_input_raw(c, ctx, tid, sink, guard)
                 }
             }
+            // MS-IME では候補窓が開いているときの Shift+Space は「前候補」。全角スペースは開いていないときだけ
+            UserAction::FullWidthSpace if session_is_selecting_fast() => {
+                self.on_candidate_move(ctx, tid, sink, guard, CandidateDir::Prev)
+            }
             UserAction::FullWidthSpace => self.on_full_width_space(ctx, tid, guard),
             UserAction::Convert => self.on_convert(ctx, tid, sink, guard),
             UserAction::CommitRaw => self.on_commit_raw(ctx, tid, sink, guard),

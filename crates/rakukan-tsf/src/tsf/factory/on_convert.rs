@@ -1030,6 +1030,20 @@ impl super::TextServiceFactory_Impl {
             tracing::debug!("on_convert: model ready → bg_start");
             engine.bg_start(llm_limit);
             convert_mark("bg_start", convert_start, &mut convert_last);
+            // [conversion] inline_wait_ms: 短い読みなら jinen は 40〜60 ms で終わるので、少しだけ同期で待って
+            // 「辞書候補を出してから差し替える」2 段の表示を 1 回にする。間に合わなければ従来どおり
+            //（下の bg_running 経路: 即時表示 + WM_TIMER）。長く待つと RPC の mutex を握ったまま
+            // 次のキーを弾くので、上限は設定側で 1000 ms に切ってある
+            let inline_wait_ms = crate::engine::config::conversion_inline_wait_ms();
+            if inline_wait_ms > 0 {
+                let done = engine.bg_wait_ms(inline_wait_ms);
+                convert_mark("inline_wait", convert_start, &mut convert_last);
+                tracing::debug!(
+                    "on_convert[new]: inline_wait_ms={inline_wait_ms} done={done} bg={} elapsed_us={}",
+                    engine.bg_status(),
+                    convert_start.elapsed().as_micros()
+                );
+            }
         }
 
         let bg_status = engine.bg_status();
