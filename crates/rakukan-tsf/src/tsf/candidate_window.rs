@@ -50,17 +50,19 @@ use windows::{
 
 // ─── レイアウト定数 ───────────────────────────────────────────────────────────
 
-// 以下の *_BASE は「フォント高さ 17px のとき」の寸法。
+// 以下の *_BASE は「フォント高さ 17px のとき」の寸法（96 DPI 基準）。
 // config.toml の [appearance] candidate_font_height を変えると、
-// scaled() が同じ比率で全ての寸法を拡大縮小する。
+// scaled() が同じ比率で全ての寸法を拡大縮小する。表示時にはモニタの実効 DPI でも拡大する
+// （`scale_font_height_for_monitor`）。比率は MS-IME の候補窓（行 = フォントの約 1.9 倍）に合わせた。
 // 幅は compute_needed_width が実フォントで実測するため、ここでは下限/上限のみ。
 
-const PADDING_X_BASE: i32 = 10;
+const PADDING_X_BASE: i32 = 14;
 const PADDING_Y_BASE: i32 = 4;
-const ITEM_HEIGHT_BASE: i32 = 26;
+const ITEM_HEIGHT_BASE: i32 = 32;
 const FONT_HEIGHT_BASE: i32 = crate::engine::config::DEFAULT_CANDIDATE_FONT_HEIGHT;
-/// 候補ウィンドウの最小幅（最大幅は `compute_needed_width` で動的に算出）
-const WIN_WIDTH_MIN_BASE: i32 = 260;
+/// 候補ウィンドウの最小幅（最大幅は `compute_needed_width` で動的に算出）。
+/// MS-IME は 1 文字の候補なら幅 130px 程度の細い窓を出すので、下限もそこに寄せる
+const WIN_WIDTH_MIN_BASE: i32 = 150;
 /// 候補ウィンドウの上限幅（画面幅に対する暴走を防ぐ）
 const WIN_WIDTH_MAX_BASE: i32 = 900;
 /// ページインジケーター行の高さ
@@ -237,6 +239,8 @@ thread_local! {
     static TL_WIN_WIDTH: Cell<i32> = Cell::new(Layout::with_font_height(configured_font_height()).win_width_min);
     /// 表示中ウィンドウのレイアウト寸法。`show_with_status()` の開始時にのみ更新する。
     static TL_LAYOUT: Cell<Layout> = Cell::new(Layout::with_font_height(configured_font_height()));
+    /// 最後に候補窓を出したモニタの実効 DPI。変わったときだけログに残すための記憶
+    static TL_LAST_DPI: Cell<u32> = const { Cell::new(0) };
 
     // ─── [Live] ライブ変換セッション状態は `live_session.rs` の LiveConvSession に集約 (M4 Phase 1)。
     // 旧 TL_LIVE_CTX / TL_LIVE_TID / TL_LIVE_DM_PTR は削除済み。
@@ -412,7 +416,9 @@ unsafe fn compute_needed_width(
         return lay.win_width_min;
     }
 
-    let face: Vec<u16> = "Meiryo UI\0".encode_utf16().collect();
+    // 描画（draw）と同じ書体で測る。書体が違うと幅が合わず、長い候補が右で切れる
+    let st = style();
+    let face: Vec<u16> = st.font_face.encode_utf16().chain(std::iter::once(0)).collect();
     let font = CreateFontW(
         lay.font_height,
         0,
@@ -692,6 +698,27 @@ fn fit_font_height(
     FONT_HEIGHT_MIN
 }
 
+/// 96 DPI 基準のフォント高さを、候補窓が出るモニタの実効 DPI で拡大する。
+///
+/// TSF DLL はアプリのプロセス内で動くので、DPI 対応アプリ（メモ帳・Terminal）では自前で拡大しないと
+/// 150% の画面で MS-IME の半分の大きさになる。DPI 非対応アプリでは 96 が返り、OS 側が窓ごと拡大する
+/// ので二重にはならない。
+unsafe fn scale_font_height_for_monitor(base: i32, hmon: windows::Win32::Graphics::Gdi::HMONITOR) -> i32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    let scaled = match GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) {
+        Ok(()) if dpi_x > 0 => (base * dpi_x as i32 + 48) / 96,
+        _ => base,
+    };
+    TL_LAST_DPI.with(|c| {
+        if c.get() != dpi_x {
+            c.set(dpi_x);
+            tracing::debug!("candwin::dpi: monitor_dpi={dpi_x} font_height {base} -> {scaled}");
+        }
+    });
+    scaled
+}
+
 /// 設定されたフォント高さのまま作業領域の高さに収まるかを見て、収まらなければ
 /// 収まる最大のフォント高さまで落としたレイアウトを返す。
 ///
@@ -706,11 +733,11 @@ unsafe fn fit_layout_to_work_area(
     has_pager: bool,
     has_status: bool,
 ) -> Layout {
-    let configured = configured_font_height();
-    let lay = Layout::with_font_height(configured);
-
     let pt = POINT { x, y: caret_bottom };
     let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let configured = scale_font_height_for_monitor(configured_font_height(), hmon);
+    let lay = Layout::with_font_height(configured);
+
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -2600,16 +2627,17 @@ mod tests {
         assert_eq!(status_for_health("something-new"), BG_ERROR_STATUS);
     }
 
-    /// 設定なし（＝既定の 17px）では、これまでの寸法と 1px も変わらないこと。
+    /// 設定なし（＝既定の 17px、96 DPI）の寸法。MS-IME の候補窓（150% 表示で行 48px = 96 DPI で 32px）に
+    /// 合わせた値で、`scaled_to` を通しても既定では 1px も動かないこと。
     #[test]
-    fn default_font_height_keeps_legacy_metrics() {
+    fn default_font_height_keeps_msime_like_metrics() {
         let lay = Layout::with_font_height(FONT_HEIGHT_BASE);
-        assert_eq!(lay.padding_x, 10);
+        assert_eq!(lay.padding_x, 14);
         assert_eq!(lay.padding_y, 4);
-        assert_eq!(lay.item_height, 26);
+        assert_eq!(lay.item_height, 32);
         assert_eq!(lay.pager_height, 22);
         assert_eq!(lay.status_height, 22);
-        assert_eq!(lay.win_width_min, 260);
+        assert_eq!(lay.win_width_min, 150);
         assert_eq!(lay.win_width_max, 900);
     }
 
