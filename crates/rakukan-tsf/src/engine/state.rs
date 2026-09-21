@@ -692,8 +692,19 @@ fn build_engine_config_json() -> String {
         Some(v) => format!(r#","model_variant":"{}""#, v),
         None => String::new(),
     };
+    // 同音異義語リランカー（[rerank]）。既定 off なので通常は enabled:false が載るだけ。
+    let rerank_json = cfg.rerank.to_engine_json();
+    if cfg.rerank.enabled {
+        tracing::info!(
+            "engine config: rerank enabled model={} lambda={} require_right_context={} timeout_ms={}",
+            cfg.rerank.model,
+            cfg.rerank.lambda,
+            cfg.rerank.require_right_context,
+            cfg.rerank.timeout_ms
+        );
+    }
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"force_inference_failure":{force_inference_failure},"rerank":{rerank_json}{mv_json}}}"#
     )
 }
 

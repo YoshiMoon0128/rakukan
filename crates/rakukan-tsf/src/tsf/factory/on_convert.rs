@@ -321,6 +321,9 @@ impl super::TextServiceFactory_Impl {
         // Convert 1 回の RPC 回数・合計時間を Drop で記録する（Step 13-2）
         let _rpc_probe = ConvertRpcProbe::start();
         update_caret_rect(ctx.clone(), tid);
+        // 同音異義語リランカー用に composition 周辺のテキストを読む（[rerank].enabled のときだけ）。
+        // 以降の merge_candidates_for_reading がこの文脈を添えてホストへ送る。
+        super::context_read::refresh_surrounding_context(&ctx, tid, engine);
         engine.flush_pending_n();
         let preedit_empty = engine.preedit_is_empty();
         if let Ok(sess) = session_get() {

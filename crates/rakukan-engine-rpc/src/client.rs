@@ -120,6 +120,16 @@ static HOST_SPAWN_GUARD: LazyLock<Mutex<HostSpawnGuard>> =
 
 pub struct RpcEngine {
     inner: Mutex<Connection>,
+    /// TSF がアプリから読んだ composition 周辺のテキスト（同音異義語リランカー用）。
+    /// `inner` とは別ロック: 接続の再確立中でも書き換えられるようにする。
+    surrounding: Mutex<Option<SurroundingContext>>,
+}
+
+/// composition の直前・直後のテキスト。`None` は「読めなかった」。
+#[derive(Debug, Clone)]
+struct SurroundingContext {
+    left: Option<String>,
+    right: Option<String>,
 }
 
 struct Connection {
@@ -189,6 +199,7 @@ impl RpcEngine {
         conn.ensure_connected()?;
         Ok(Self {
             inner: Mutex::new(conn),
+            surrounding: Mutex::new(None),
         })
     }
 
@@ -406,19 +417,25 @@ impl RpcEngine {
             .unwrap_or(false)
     }
 
+    // 確定・リセットは composition の終わりなので、預かっていた周辺テキストも捨てる
+    // （次の composition で古い文脈を使わないため）。
     pub fn commit(&self, text: &str) {
+        self.clear_surrounding_context();
         let _ = self.call_unit(Request::Commit { text: text.into() });
     }
     pub fn commit_as_hiragana(&self) {
+        self.clear_surrounding_context();
         let _ = self.call_unit(Request::CommitAsHiragana);
     }
     pub fn reset_preedit(&self) {
+        self.clear_surrounding_context();
         let _ = self.call_unit(Request::ResetPreedit);
     }
     pub fn force_preedit(&self, text: String) {
         let _ = self.call_unit(Request::ForcePreedit { text });
     }
     pub fn reset_all(&self) {
+        self.clear_surrounding_context();
         let _ = self.call_unit(Request::ResetAll);
     }
 
@@ -429,18 +446,71 @@ impl RpcEngine {
     ///
     /// 旧 `merge_candidates()`（ホスト内部の hiragana_buf を参照）は Issue #9 で削除した。
     /// 呼び出し側は「実際に候補が取れたキー」を必ず渡すこと。
+    /// 候補をマージする。`set_surrounding_context` で左右の文脈が預けられていれば
+    /// `MergeCandidatesForReadingWithContext` を使い、無ければ従来の `MergeCandidatesForReading`。
+    /// 呼び元（TSF の各変換経路）は文脈の有無を意識しなくてよい。
     pub fn merge_candidates_for_reading(
         &self,
         reading: &str,
         llm_cands: Vec<String>,
         limit: usize,
     ) -> Vec<String> {
-        self.call_strings(Request::MergeCandidatesForReading {
+        match self.surrounding_context() {
+            Some(SurroundingContext { left, right }) => self
+                .call_strings(Request::MergeCandidatesForReadingWithContext {
+                    reading: reading.into(),
+                    llm_cands,
+                    limit: limit as u32,
+                    left_context: left,
+                    right_context: right,
+                })
+                .unwrap_or_default(),
+            None => self
+                .call_strings(Request::MergeCandidatesForReading {
+                    reading: reading.into(),
+                    llm_cands,
+                    limit: limit as u32,
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 文脈を明示して候補をマージする（`DynEngine` と同じシグネチャ）。
+    pub fn merge_candidates_for_reading_with_context(
+        &self,
+        reading: &str,
+        llm_cands: Vec<String>,
+        limit: usize,
+        left_context: Option<&str>,
+        right_context: Option<&str>,
+    ) -> Vec<String> {
+        self.call_strings(Request::MergeCandidatesForReadingWithContext {
             reading: reading.into(),
             llm_cands,
             limit: limit as u32,
+            left_context: left_context.map(str::to_owned),
+            right_context: right_context.map(str::to_owned),
         })
         .unwrap_or_default()
+    }
+
+    /// TSF がアプリから読んだ composition 周辺のテキストを預ける。以降の
+    /// `merge_candidates_for_reading` がこれを添えて送る。変換キーを押すたびに読み直し、
+    /// 確定・リセットで `clear_surrounding_context` する。
+    pub fn set_surrounding_context(&self, left: Option<String>, right: Option<String>) {
+        if let Ok(mut g) = self.surrounding.lock() {
+            *g = Some(SurroundingContext { left, right });
+        }
+    }
+
+    pub fn clear_surrounding_context(&self) {
+        if let Ok(mut g) = self.surrounding.lock() {
+            *g = None;
+        }
+    }
+
+    fn surrounding_context(&self) -> Option<SurroundingContext> {
+        self.surrounding.lock().ok().and_then(|g| g.clone())
     }
     pub fn start_load_model(&self) {
         let _ = self.call_unit(Request::StartLoadModel);

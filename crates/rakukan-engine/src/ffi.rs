@@ -17,7 +17,8 @@ use crate::{EngineConfig, RakunEngine};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-pub const ENGINE_ABI_VERSION: u32 = 9;
+/// v10: `engine_merge_candidates_for_reading_ctx`（左右の文脈付きマージ）を追加
+pub const ENGINE_ABI_VERSION: u32 = 10;
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
@@ -122,6 +123,14 @@ unsafe fn from_cstr<'a>(ptr: *const c_char) -> &'a str {
         return "";
     }
     unsafe { CStr::from_ptr(ptr).to_str().unwrap_or("") }
+}
+
+/// NULL を None として区別する版（「取れなかった」と「空だった」を分ける）。
+unsafe fn from_cstr_opt<'a>(ptr: *const c_char) -> Option<&'a str> {
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe { CStr::from_ptr(ptr).to_str().ok() }
 }
 
 // ─── ライフサイクル ────────────────────────────────────────────────────────────
@@ -472,6 +481,30 @@ pub extern "C" fn engine_merge_candidates_for_reading(
     };
     set_dict_status(dict_debug);
     let merged = engine.merge_candidates_for_reading(reading, llm_cands, limit as usize);
+    let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// `engine_merge_candidates_for_reading` に、TSF がアプリから読んだ左右の文脈を添える版（ABI v10）。
+/// `left` / `right` は NULL 可（NULL = 取れなかった）。リランカーが無い DLL では文脈を無視して同じ結果を返す。
+/// 戻り値: JSON `["候補1","候補2",...]`。`engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_merge_candidates_for_reading_ctx(
+    handle: *mut c_void,
+    reading: *const c_char,
+    llm_json: *const c_char,
+    limit: u32,
+    left: *const c_char,
+    right: *const c_char,
+) -> *mut c_char {
+    let engine = unsafe { &*(handle as *const RakunEngine) };
+    let reading = unsafe { from_cstr(reading) };
+    let s = unsafe { from_cstr(llm_json) };
+    let llm_cands: Vec<String> = serde_json::from_str(s).unwrap_or_default();
+    let left = unsafe { from_cstr_opt(left) };
+    let right = unsafe { from_cstr_opt(right) };
+    let merged =
+        engine.merge_candidates_for_reading_with_context(reading, llm_cands, limit as usize, left, right);
     let json = serde_json::to_string(&merged).unwrap_or_else(|_| "[]".into());
     unsafe { to_cstr(json) }
 }

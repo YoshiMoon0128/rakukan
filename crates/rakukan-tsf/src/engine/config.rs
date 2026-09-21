@@ -22,10 +22,115 @@ pub struct AppConfig {
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+    #[serde(default)]
+    pub rerank: RerankConfig,
 
     /// 旧形式との互換用（config.toml に num_candidates = N と書いた場合に有効）。
     #[serde(default)]
     pub num_candidates: Option<usize>,
+}
+
+/// 同音異義語リランカー（`[rerank]`）。
+///
+/// 辞書候補を、composition 周辺のテキストを読む小型 LM（Qwen3 系）の対数尤度で並べ替える。
+/// 値は EngineConfig JSON に載せてホストへ渡す。engine DLL が feature `rerank` 付きで
+/// ビルドされていないと無視される（ホストのログに WARN が出る）。
+/// 既定値は engine 側の `RerankSettings` と揃えておく。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    /// 並べ替えを使うか。既定 false（rakukan の既存挙動を変えない）
+    pub enabled: bool,
+    /// リランカーの GGUF の ID。`qwen3-1.7b-q8_0`（既定）か `qwen3-0.6b-q8_0`
+    pub model: String,
+    /// GGUF のパスを直接指定する（`model` より優先）。試験用
+    pub model_path: Option<String>,
+    /// 辞書順の事前分布との混合比。1.0 で LM だけ。0.6B のときは 0.8
+    pub lambda: f32,
+    /// 事前分布の減衰
+    pub rho: f32,
+    /// true なら右文脈が取れた場面だけ並べ替える。0.6B では true にする
+    pub require_right_context: bool,
+    /// composition の直前から読む文字数
+    pub left_chars: usize,
+    /// composition の直後から読む文字数
+    pub right_chars: usize,
+    /// 右文脈のうち候補の後ろに付けて採点する文字数
+    pub right_tail_chars: usize,
+    /// 採点に使うスレッド数。0 = 自動（論理コア数、上限 8）
+    pub threads: u32,
+    /// 並べ替えの対象にする候補数の上限
+    pub max_candidates: usize,
+    /// 採点をこれ以上待たない（ms）。超えたら辞書順のまま出す
+    pub timeout_ms: u64,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: "qwen3-1.7b-q8_0".into(),
+            model_path: None,
+            lambda: 1.0,
+            rho: 0.5,
+            require_right_context: false,
+            left_chars: 200,
+            right_chars: 20,
+            right_tail_chars: 2,
+            threads: 0,
+            max_candidates: 6,
+            timeout_ms: 150,
+        }
+    }
+}
+
+impl RerankConfig {
+    /// EngineConfig JSON の `"rerank"` の値。engine 側 `RerankSettings` のフィールド名に合わせる。
+    pub fn to_engine_json(&self) -> String {
+        let model_path = match &self.model_path {
+            Some(p) => format!(r#","model_path":{}"#, json_string(p)),
+            None => String::new(),
+        };
+        format!(
+            r#"{{"enabled":{},"model":{},"lambda":{},"rho":{},"require_right_context":{},"left_chars":{},"right_chars":{},"right_tail_chars":{},"threads":{},"max_candidates":{},"timeout_ms":{}{}}}"#,
+            self.enabled,
+            json_string(&self.model),
+            json_number(self.lambda),
+            json_number(self.rho),
+            self.require_right_context,
+            self.left_chars,
+            self.right_chars,
+            self.right_tail_chars,
+            self.threads,
+            self.max_candidates,
+            self.timeout_ms,
+            model_path,
+        )
+    }
+}
+
+/// JSON 文字列リテラル（引用符付き）。`\` と `"` と制御文字をエスケープする。
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// JSON の数値。NaN / 無限は JSON に無いので既定の 1.0 に落とす。
+fn json_number(x: f32) -> String {
+    if x.is_finite() { format!("{x}") } else { "1.0".into() }
 }
 
 /// 候補ウィンドウの見た目。
@@ -718,6 +823,25 @@ warn_on_unknown_key = true
 # GPU デバイス消失からの復帰 (Issue #43) の確認用。変換は辞書候補だけになる。
 # force_inference_failure = true
 
+[rerank]
+# 同音異義語リランカー: 辞書候補を、カーソル前後のテキストを読む小型 LM で並べ替える。
+# engine DLL が feature "rerank" 付きでビルドされている必要がある。既定 off。
+enabled = false
+# モデル: "qwen3-1.7b-q8_0"（既定、約 1.8 GB、精度優先）/ "qwen3-0.6b-q8_0"（約 640 MB、速度優先）
+# 初回に HuggingFace から取得する（jinen と同じ置き場）。model_path で GGUF を直接指定してもよい。
+# model = "qwen3-1.7b-q8_0"
+# 辞書順との混合比。1.7B は 1.0、0.6B は 0.8 が目安
+# lambda = 1.0
+# 0.6B は右文脈（カーソル以降のテキスト）が取れた場面だけ並べ替える
+# require_right_context = false
+# カーソル前後から読む文字数
+# left_chars = 200
+# right_chars = 20
+# 採点に使うスレッド数（0 = 自動）、対象候補数、待ち時間の上限 (ms)
+# threads = 0
+# max_candidates = 6
+# timeout_ms = 150
+
 # 旧形式との互換用:
 # num_candidates = 6
 "#
@@ -796,6 +920,43 @@ force_inference_failure = true
         )
         .expect("parse");
         assert!(cfg.diagnostics.force_inference_failure);
+    }
+
+    #[test]
+    fn rerank_section_is_off_by_default_and_parses_when_present() {
+        let cfg: AppConfig = toml::from_str("[general]\n").expect("parse");
+        assert!(!cfg.rerank.enabled);
+        assert!(cfg.rerank.to_engine_json().contains(r#""enabled":false"#));
+
+        let cfg: AppConfig = toml::from_str(
+            "[rerank]
+enabled = true
+model = \"qwen3-0.6b-q8_0\"
+lambda = 0.8
+require_right_context = true
+timeout_ms = 120
+",
+        )
+        .expect("parse");
+        assert!(cfg.rerank.enabled);
+        assert_eq!(cfg.rerank.model, "qwen3-0.6b-q8_0");
+        assert!(cfg.rerank.require_right_context);
+        let json = cfg.rerank.to_engine_json();
+        assert!(json.contains(r#""model":"qwen3-0.6b-q8_0""#), "{json}");
+        assert!(json.contains(r#""lambda":0.8"#), "{json}");
+        assert!(json.contains(r#""timeout_ms":120"#), "{json}");
+    }
+
+    #[test]
+    fn rerank_model_path_with_backslashes_is_escaped_in_engine_json() {
+        let cfg: AppConfig = toml::from_str(
+            "[rerank]
+model_path = 'C:\\models\\q.gguf'
+",
+        )
+        .expect("parse");
+        let json = cfg.rerank.to_engine_json();
+        assert!(json.contains(r#""model_path":"C:\\models\\q.gguf""#), "{json}");
     }
 
     #[test]

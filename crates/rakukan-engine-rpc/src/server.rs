@@ -257,6 +257,7 @@ pub(crate) fn request_label(req: &Request) -> &'static str {
         Learn { .. } => "Learn",
         LearnForce { .. } => "LearnForce",
         MergeCandidatesForReading { .. } => "MergeCandidatesForReading",
+        MergeCandidatesForReadingWithContext { .. } => "MergeCandidatesForReadingWithContext",
         LastError => "LastError",
         DictStatus => "DictStatus",
         EngineHealth => "EngineHealth",
@@ -564,6 +565,19 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
         } => {
             Response::Strings(eng.merge_candidates_for_reading(&reading, llm_cands, limit as usize))
         }
+        MergeCandidatesForReadingWithContext {
+            reading,
+            llm_cands,
+            limit,
+            left_context,
+            right_context,
+        } => Response::Strings(eng.merge_candidates_for_reading_with_context(
+            &reading,
+            llm_cands,
+            limit as usize,
+            left_context.as_deref(),
+            right_context.as_deref(),
+        )),
         LastError => Response::String(eng.last_error()),
         DictStatus => Response::String(eng.dict_status()),
 

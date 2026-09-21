@@ -20,7 +20,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 
-const EXPECTED_ENGINE_ABI_VERSION: u32 = 9;
+/// v10: `engine_merge_candidates_for_reading_ctx`（左右の文脈付きマージ）を追加
+const EXPECTED_ENGINE_ABI_VERSION: u32 = 10;
 
 // ─── Segments モデル（CONVERTER_REDESIGN Phase A） ────────────────────────────
 
@@ -128,6 +129,15 @@ struct EngineVTable {
     merge_candidates: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
     merge_candidates_for_reading:
         unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, u32) -> *mut c_char,
+    /// 左右の文脈付き（ABI v10）。left / right は NULL 可
+    merge_candidates_for_reading_ctx: unsafe extern "C" fn(
+        *mut c_void,
+        *const c_char,
+        *const c_char,
+        u32,
+        *const c_char,
+        *const c_char,
+    ) -> *mut c_char,
 
     // 非同期初期化
     start_load_model: unsafe extern "C" fn(*mut c_void),
@@ -223,6 +233,10 @@ impl EngineVTable {
             convert_sync: load_sym!(lib, b"engine_convert_sync\0"),
             merge_candidates: load_sym!(lib, b"engine_merge_candidates\0"),
             merge_candidates_for_reading: load_sym!(lib, b"engine_merge_candidates_for_reading\0"),
+            merge_candidates_for_reading_ctx: load_sym!(
+                lib,
+                b"engine_merge_candidates_for_reading_ctx\0"
+            ),
             start_load_model: load_sym!(lib, b"engine_start_load_model\0"),
             poll_model_ready: load_sym!(lib, b"engine_poll_model_ready\0"),
             start_load_dict: load_sym!(lib, b"engine_start_load_dict\0"),
@@ -566,6 +580,38 @@ impl DynEngine {
                 creading.as_ptr(),
                 cjson.as_ptr(),
                 limit as u32,
+            );
+            match self.take_cstr(ptr) {
+                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+                None => vec![],
+            }
+        }
+    }
+
+    /// `merge_candidates_for_reading` に、TSF がアプリから読んだ左右の文脈を添える（ABI v10）。
+    /// `None` は「取れなかった」。リランカーが無い DLL では文脈は無視される。
+    pub fn merge_candidates_for_reading_with_context(
+        &self,
+        reading: &str,
+        llm_cands: Vec<String>,
+        limit: usize,
+        left_context: Option<&str>,
+        right_context: Option<&str>,
+    ) -> Vec<String> {
+        let creading = Self::to_cstring(reading);
+        let json = serde_json::to_string(&llm_cands).unwrap_or_else(|_| "[]".into());
+        let cjson = Self::to_cstring(&json);
+        let cleft = left_context.map(Self::to_cstring);
+        let cright = right_context.map(Self::to_cstring);
+        let null = std::ptr::null::<c_char>();
+        unsafe {
+            let ptr = (self.vtable.merge_candidates_for_reading_ctx)(
+                self.handle,
+                creading.as_ptr(),
+                cjson.as_ptr(),
+                limit as u32,
+                cleft.as_ref().map_or(null, |c| c.as_ptr()),
+                cright.as_ref().map_or(null, |c| c.as_ptr()),
             );
             match self.take_cstr(ptr) {
                 Some(s) => serde_json::from_str(&s).unwrap_or_default(),

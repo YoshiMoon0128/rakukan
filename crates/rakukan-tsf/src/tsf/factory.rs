@@ -86,6 +86,7 @@ use crate::{
 
 // M3 T1-A: factory.rs 分割。composition=on_compose, 入力=on_input, 変換=on_convert,
 // 編集操作=edit_ops, dispatcher (handle_action)=dispatch。
+mod context_read;
 mod dispatch;
 mod edit_ops;
 mod on_compose;

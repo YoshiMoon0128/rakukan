@@ -17,7 +17,8 @@ pub const PIPE_BASE_NAME: &str = "rakukan-engine";
 /// - v4: `MergeCandidatesForReading` を追加
 /// - (v4 のまま) `MergeCandidates` を廃止して `_ReservedMergeCandidates` に。
 ///   ホストは `Error` を返す（TSF 側の呼び出しは同時に削除済み）
-pub const PROTOCOL_VERSION: u32 = 5;
+/// - v6: `MergeCandidatesForReadingWithContext` を追加（同音異義語リランカーの左右の文脈）
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// `InputChar` バッチ RPC で指定する入力モード。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,6 +235,24 @@ pub enum Request {
     /// `Shutdown` にフォールバックするため互換性は保たれる。
     ShutdownIfConfigDiffers {
         config_json: Option<String>,
+    },
+
+    // ─── 変換（追加 v6）────────────────────────────────────
+    /// `MergeCandidatesForReading` に、TSF がアプリから読んだ左右の文脈を添える。
+    ///
+    /// 同音異義語リランカー（engine の feature `rerank`）が候補を並べ替えるのに使う。
+    /// `left_context` は composition 直前のテキスト（None なら engine が確定文を使う）、
+    /// `right_context` は composition 直後のテキスト（取れない場面は None）。
+    /// リランカーが無ければ `MergeCandidatesForReading` と同じ結果になる。
+    ///
+    /// NOTE: postcard の enum discriminant は宣言順なので末尾に追加する。既存の `BgStart` /
+    /// `ConvertSync` に field を足すとワイヤ表現が変わるため、別 variant にした。
+    MergeCandidatesForReadingWithContext {
+        reading: String,
+        llm_cands: Vec<String>,
+        limit: u32,
+        left_context: Option<String>,
+        right_context: Option<String>,
     },
 }
 

@@ -23,8 +23,29 @@ param(
     [string]$BuildDir = "C:\rb",
     # -FullClean: delete entire build dir incl. llama/CUDA cache (slow; rarely needed)
     # Default: clean only rakukan-engine rlib/cdylib, keep llama/CUDA cache (fast)
-    [switch]$FullClean
+    [switch]$FullClean,
+    # -Features: extra cargo features for every engine DLL (comma separated), e.g. "rerank".
+    # Defaults to $env:RAKUKAN_ENGINE_FEATURES so `cargo make build-engine` can pick it up.
+    [string]$Features = $env:RAKUKAN_ENGINE_FEATURES,
+    # -TargetCpu: rustc target-cpu for the engine DLLs, e.g. "x86-64-v3" (AVX2) or "znver4".
+    # llama-cpp-sys-2 reads it and turns on the matching GGML_AVX* flags for llama.cpp; without it
+    # llama.cpp is built for baseline x86-64 (no AVX2) and CPU inference is ~3x slower.
+    # Off by default so the stock DLL keeps running on CPUs without AVX2.
+    # Defaults to $env:RAKUKAN_TARGET_CPU.
+    [string]$TargetCpu = $env:RAKUKAN_TARGET_CPU
 )
+
+# Join the per-backend feature with the extra features (either may be empty).
+function Join-Features {
+    param([string]$Backend, [string]$Extra)
+    $parts = @($Backend, $Extra) | Where-Object { $_ }
+    return ($parts -join ",")
+}
+if ($Features) { Write-Host "[engine] extra features: $Features" }
+if ($TargetCpu) {
+    $env:RUSTFLAGS = (($env:RUSTFLAGS, "-C target-cpu=$TargetCpu") | Where-Object { $_ }) -join " "
+    Write-Host "[engine] RUSTFLAGS: $env:RUSTFLAGS"
+}
 
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path $PSScriptRoot)
@@ -244,7 +265,7 @@ if ($nvcc) {
 
 # --- CPU DLL ---
 Write-Host "[engine] Building cpu DLL..."
-Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features ""
+Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features (Join-Features "" $Features)
 if (Test-Path $cpuDll) {
     Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_cpu.dll") -Force
     Write-Host "[engine] [OK] cpu DLL"
@@ -255,7 +276,7 @@ if (Test-Path $cpuDll) {
 # --- Vulkan DLL ---
 if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
     Write-Host "[engine] Building vulkan DLL..."
-    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features "rakukan-engine/vulkan"
+    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features (Join-Features "rakukan-engine/vulkan" $Features)
     if (Test-Path $cpuDll) {
         Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_vulkan.dll") -Force
         Write-Host "[engine] [OK] vulkan DLL"
@@ -267,7 +288,7 @@ if ($env:VULKAN_SDK -and (Test-Path $env:VULKAN_SDK)) {
 # --- CUDA DLL ---
 if ($nvcc) {
     Write-Host "[engine] Building cuda DLL..."
-    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features "rakukan-engine/cuda"
+    Invoke-CargoBuild -Package "rakukan-engine" -Profile $Profile -Features (Join-Features "rakukan-engine/cuda" $Features)
     if (Test-Path $cpuDll) {
         Copy-Item $cpuDll (Join-Path $BuildDir "$profileDir\rakukan_engine_cuda.dll") -Force
         Write-Host "[engine] [OK] cuda DLL"

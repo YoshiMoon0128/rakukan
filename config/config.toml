@@ -73,3 +73,22 @@ warn_on_unknown_key = true
 
 # 旧形式との互換用
 # num_candidates = 9
+
+[rerank]
+# 同音異義語リランカー: 辞書候補を、カーソル前後のテキストを読む小型 LM で並べ替える。
+# engine DLL が feature "rerank" 付きでビルドされている必要がある。既定 off。
+enabled = false
+# モデル: "qwen3-1.7b-q8_0"（既定、約 1.8 GB、精度優先）/ "qwen3-0.6b-q8_0"（約 640 MB、速度優先）
+# 初回に HuggingFace から取得する（jinen と同じ置き場）。model_path で GGUF を直接指定してもよい。
+# model = "qwen3-1.7b-q8_0"
+# 辞書順との混合比。1.7B は 1.0、0.6B は 0.8 が目安
+# lambda = 1.0
+# 0.6B は右文脈（カーソル以降のテキスト）が取れた場面だけ並べ替える
+# require_right_context = false
+# カーソル前後から読む文字数
+# left_chars = 200
+# right_chars = 20
+# 採点に使うスレッド数（0 = 自動）、対象候補数、待ち時間の上限 (ms)
+# threads = 0
+# max_candidates = 6
+# timeout_ms = 150
