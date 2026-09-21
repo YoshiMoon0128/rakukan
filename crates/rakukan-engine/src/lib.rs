@@ -747,12 +747,14 @@ impl RakunEngine {
 
     /// 確定時に呼ぶ。Backspace で消して打ち直した結果、かなが変わっていたら記録する。
     /// romaji は Backspace で書き換わる（再生用の列）ので、書くかどうかはかなで決める。
-    fn flush_typo_log(&mut self) {
+    /// `after_surface` は確定した文字列（打ち直した composition の変換結果）。MS-IME の辞書へ写すとき、
+    /// 文の長さの読み（かんじにや）には辞書の表層が無いので、これを登録する語にする
+    fn flush_typo_log(&mut self, after_surface: &str) {
         let Some((before, before_kana)) = self.typo_before.take() else { return };
         let Some(log) = &self.typo_log else { return };
         let after_kana = self.hiragana_buf.clone();
         if !after_kana.is_empty() && before_kana != after_kana {
-            log.record(&before, &self.romaji_log_str(), &before_kana, &after_kana);
+            log.record(&before, &self.romaji_log_str(), &before_kana, &after_kana, after_surface);
         }
     }
 
@@ -1205,7 +1207,7 @@ impl RakunEngine {
 
     pub fn commit(&mut self, text: &str) {
         info!("engine::commit: {:?}", text);
-        self.flush_typo_log();
+        self.flush_typo_log(text);
         if is_context_echo_risk(text) {
             // 未変換のまま確定されたひらがな文を context に入れると、同じ読みの
             // 変換で LLM がコピー（エコー）に収束する（v0.9.15 のエコーアトラクタ）。

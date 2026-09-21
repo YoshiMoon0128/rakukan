@@ -34,17 +34,20 @@ impl TypoLog {
     /// （"kanji" の じ を消すと "kanj" が残る）。打ち直した部分の継ぎ目には再生用の文字が混ざるので、
     /// 打鍵そのものの記録ではなく材料として読む。かなは表示そのもの。
     /// 書けなくても IME は止めない（失敗は無視する）。
-    pub fn record(&self, before: &str, after: &str, before_kana: &str, after_kana: &str) {
+    /// `after_surface` は打ち直した composition を確定した文字列。崩れ → 正しい語 の対を MS-IME の辞書へ写すときの語
+    /// （文の長さの読みには辞書の表層が無い）。
+    pub fn record(&self, before: &str, after: &str, before_kana: &str, after_kana: &str, after_surface: &str) {
         let t = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let line = format!(
-            "{{\"t\":{t},\"before\":{},\"after\":{},\"before_kana\":{},\"after_kana\":{}}}\n",
+            "{{\"t\":{t},\"before\":{},\"after\":{},\"before_kana\":{},\"after_kana\":{},\"after_surface\":{}}}\n",
             json_str(before),
             json_str(after),
             json_str(before_kana),
-            json_str(after_kana)
+            json_str(after_kana),
+            json_str(after_surface)
         );
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
             let _ = f.write_all(line.as_bytes());
@@ -78,12 +81,12 @@ mod tests {
     fn 消す前と確定時の打鍵列が_1行のjsonで追記される() {
         let dir = tempfile::tempdir().unwrap();
         let log = TypoLog::new(dir.path().join("typo.log"));
-        log.record("kannijiya", "kanjiniya", "かんにじや", "かんじにや");
-        log.record("a\"b", "ab", "", "");
+        log.record("kannijiya", "kanjiniya", "かんにじや", "かんじにや", "感じにや");
+        log.record("a\"b", "ab", "", "", "");
         let text = std::fs::read_to_string(log.path()).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains(r#""before":"kannijiya","after":"kanjiniya","before_kana":"かんにじや","after_kana":"かんじにや""#), "{}", lines[0]);
+        assert!(lines[0].contains(r#""before":"kannijiya","after":"kanjiniya","before_kana":"かんにじや","after_kana":"かんじにや","after_surface":"感じにや""#), "{}", lines[0]);
         assert!(lines[1].contains(r#""before":"a\"b""#), "{}", lines[1]);
     }
 }

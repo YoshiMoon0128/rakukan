@@ -65,6 +65,10 @@ struct Args {
     /// MS-IME は同じ読みで複数の語を持てるので、候補窓に両方出る
     #[arg(long, default_value_t = 2)]
     surfaces_per_reading: usize,
+    /// 生成せず、「崩れ TAB 正しい読み」の対（typo.log から作ったもの）をそのまま行にする。表層は正しい読みの辞書の先頭
+    /// `surfaces_per_reading` 語。崩れが辞書にある読みでも登録する（実際に打ち間違えた読みなので、候補が 1 つ増えるだけで害は小さい）
+    #[arg(long)]
+    pairs_file: Option<PathBuf>,
 }
 
 /// 崩れ方の自然さ。かな数が変わらず小書き文字（ぁぃぅぇぉ ゃゅょ の単独）を含まないもの（かてい → かとい）を先に、
@@ -193,9 +197,71 @@ fn is_hiragana(s: &str) -> bool {
     s.chars().all(|c| matches!(c, '\u{3041}'..='\u{3096}' | 'ー'))
 }
 
+/// 行（読み TAB 語句 TAB 品詞）を MS-IME ユーザー辞書ツールの形式（UTF-16LE + BOM、CRLF）で書く
+fn write_msime(path: &std::path::Path, rows: &[(String, String)], pos: &str, comment: &str) -> Result<()> {
+    let mut text = String::new();
+    text.push_str("!Microsoft IME Dictionary Tool\r\n");
+    text.push_str(&format!("!{comment}\r\n"));
+    for (mis, surface) in rows {
+        text.push_str(&format!("{mis}\t{surface}\t{pos}\r\n"));
+    }
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for u in text.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    std::fs::write(path, &bytes).with_context(|| format!("write {}", path.display()))
+}
+
+/// `--pairs-file`: 崩れ TAB 正しい読み（TAB 表層、省略可）の対を行にする
+fn from_pairs(args: &Args, dict: &MozcDict, path: &std::path::Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut no_surface = 0usize;
+    for line in text.lines() {
+        let cols: Vec<&str> = line.trim().split('\t').collect();
+        if cols.len() < 2 || cols[0].is_empty() || cols[1].is_empty() || cols[0] == cols[1] {
+            continue;
+        }
+        let (mis, reading) = (cols[0], cols[1]);
+        let surfaces: Vec<String> = if cols.len() >= 3 && !cols[2].is_empty() {
+            vec![cols[2].to_string()]
+        } else {
+            dict.lookup(reading, 64)
+                .into_iter()
+                .filter(|(_, c)| cost_band::classify(*c) == cost_band::Class::Normal)
+                .map(|(s, _)| s)
+                .take(args.surfaces_per_reading)
+                .collect()
+        };
+        // 辞書に無い読み（文の長さなど）で表層も渡されていなければ、正しい読みそのものを語にする。
+        // 崩れを打っても正しいかなが候補に出るので、そこから変換し直せる
+        let surfaces = if surfaces.is_empty() {
+            no_surface += 1;
+            eprintln!("no dictionary surface for reading {reading:?} (from {mis:?}); registering the reading itself");
+            vec![reading.to_string()]
+        } else {
+            surfaces
+        };
+        for s in surfaces {
+            if !rows.iter().any(|(m, sf)| *m == mis && *sf == s) {
+                rows.push((mis.to_string(), s));
+            }
+        }
+    }
+    write_msime(&args.out, &rows, &args.pos, "rakukan-typo-dict --pairs-file: typo.log の実際の打ち間違い → 正しい語")?;
+    println!("wrote {} rows from pairs to {} (pairs without a dictionary surface: {no_surface})", rows.len(), args.out.display());
+    for (m, s) in rows.iter().take(30) {
+        println!("  {m} -> {s}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let dict = MozcDict::open(&args.dict).with_context(|| format!("open {}", args.dict.display()))?;
+    if let Some(p) = &args.pairs_file {
+        return from_pairs(&args, &dict, p);
+    }
 
     // 読みごとに最頻（cost 最小）の通常語の表層
     let mut best: HashMap<String, (String, u16)> = HashMap::new();
