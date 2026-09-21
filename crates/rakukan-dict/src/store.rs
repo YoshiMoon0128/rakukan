@@ -534,6 +534,16 @@ impl DictStore {
         result
     }
 
+    /// ひらがな読みの mozc 通常語候補のうち最小の cost（小さいほど頻出）。通常語が無ければ None。
+    /// 誤入力補正が、同じ編集コストの補正後の読みを頻度で並べるのに使う
+    pub fn dict_top_cost(&self, reading: &str) -> Option<u16> {
+        let mozc = self.inner.mozc.as_ref()?;
+        mozc.lookup(reading, u16::MAX as usize)
+            .into_iter()
+            .find(|(_, cost)| cost_band::classify(*cost) == cost_band::Class::Normal)
+            .map(|(_, cost)| cost)
+    }
+
     /// ひらがな読みから記号候補（`symbol.tsv` 由来、mozc の行順）を全件返す（Step 12-2）
     pub fn lookup_symbols(&self, reading: &str) -> Vec<String> {
         self.lookup_class(reading, cost_band::Class::Symbol, usize::MAX)

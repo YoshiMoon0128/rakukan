@@ -291,7 +291,9 @@ pub struct TypoSettings {
 
 impl Default for TypoSettings {
     fn default() -> Self {
-        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 2.0, word_max_chars: 8 }
+        // edit_penalty は実測で決めた（2026-09-21、Qwen3-1.7B、λ=1）。本物の打ち間違いでは補正候補が元候補を
+        // 13〜17 nat 上回り、正しく打った珍しめの語が隣の頻出語に負ける差は 7 nat だった。10 はその間
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8 }
     }
 }
 
@@ -1339,7 +1341,7 @@ impl RakunEngine {
     /// `hiragana` が今の composition と一致するときだけ（`input_log` がその打鍵）。補正後の読みごとに辞書の
     /// 先頭 1 語を候補にし、既に `merged` にある表層は足さない。審判（リランカー）が使う編集コストを添える。
     #[cfg(feature = "rerank")]
-    fn append_typo_alternatives(&self, hiragana: &str, mut merged: Vec<String>) -> (Vec<String>, Vec<f32>, usize) {
+    fn append_typo_alternatives(&self, hiragana: &str, mut merged: Vec<String>, learn: &[String], user: &[String]) -> (Vec<String>, Vec<f32>, usize) {
         let mut costs = vec![0.0f32; merged.len()];
         let t = &self.config.typo;
         if !t.enabled {
@@ -1358,25 +1360,42 @@ impl RakunEngine {
             return (merged, costs, 0);
         };
         let has = |r: &str| !store.lookup_dict(r, 1).is_empty() || !store.lookup_user(r).is_empty();
-        let alts = typo::alternatives(&units, hiragana, &typo::Rule::ALL, t.max_alternatives, &has);
+        // ユーザー辞書にある読みは最頻出扱い、mozc に無い読みは最後
+        let rank = |r: &str| if store.lookup_user(r).is_empty() { store.dict_top_cost(r).unwrap_or(u16::MAX) } else { 0 };
+        let alts = typo::alternatives(&units, hiragana, &typo::Rule::ALL, t.max_alternatives, &has, &rank);
         if alts.is_empty() {
             debug!("typo: no alternatives reading={hiragana:?} units={}", units.len());
         }
+        // 審判が採点する元候補の窓（固定分 + max_candidates）。ここに既にある表層は補正候補にしない
+        let window_end = {
+            let max = self.reranker.as_ref().map(|r| r.config().max_candidates).unwrap_or(0);
+            let (pinned, n) = rerank::split_targets(&merged, learn, user, max);
+            pinned + n
+        };
         let mut added = 0;
         for alt in &alts {
-            // 表層が読みそのままでも足す（「ありがとう」のように辞書の先頭がひらがなの語がある）。
-            // 「かきい」のような屑は審判（LM）が下げる
-            let surface = store
-                .lookup_user(&alt.reading)
-                .into_iter()
-                .chain(store.lookup_dict(&alt.reading, 1))
-                .find(|s| !merged.contains(s));
-            if let Some(s) = surface {
-                debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s);
-                merged.push(s);
-                costs.push(alt.cost);
-                added += 1;
+            // 補正後の読みの先頭 1 語。表層が読みそのままでも足す（「ありがとう」のように辞書の先頭が
+            // ひらがなの語がある）。「かきい」のような屑は審判（LM）が下げる
+            let Some(s) = store.lookup_user(&alt.reading).into_iter().chain(store.lookup_dict(&alt.reading, 1)).next() else {
+                continue;
+            };
+            match merged.iter().position(|m| m == &s) {
+                // 元の候補として採点されるので、補正候補として足す意味がない
+                Some(p) if p < window_end => {
+                    debug!("typo: alt reading={:?} surface={:?} already in window pos={p}", alt.reading, s);
+                    continue;
+                }
+                // 窓の外（jinen の 5 番目以降など）にある。2 番手の表層を足すより、それを審判の前に引き上げる
+                Some(p) => {
+                    debug!("typo: alt reading={:?} rule={} cost={} surface={:?} promoted from pos={p}", alt.reading, alt.rule.name(), alt.cost, s);
+                    merged.remove(p);
+                    costs.remove(p);
+                }
+                None => debug!("typo: alt reading={:?} rule={} cost={} surface={:?}", alt.reading, alt.rule.name(), alt.cost, s),
             }
+            merged.push(s);
+            costs.push(alt.cost);
+            added += 1;
         }
         (merged, costs, added)
     }
@@ -1496,7 +1515,7 @@ impl RakunEngine {
                 };
                 // 誤入力補正（段取り 2）: 補正後の読みの辞書候補を末尾に足し、編集コスト付きで審判にかける。
                 // 採点できないときは辞書順のまま返るので、補正候補は元の候補の後ろに残る
-                let (merged, costs, extra) = self.append_typo_alternatives(hiragana, merged);
+                let (merged, costs, extra) = self.append_typo_alternatives(hiragana, merged, &learn_cands, &user_cands);
                 rr.rerank_with_costs(left, right_context, merged, &learn_cands, &user_cands, &costs, self.config.typo.edit_penalty, extra)
             }
             _ => merged,
@@ -3229,11 +3248,11 @@ mod typo_integration_tests {
     use super::*;
     use std::time::Duration;
 
-    /// 2 番目の候補を常に最良にする偽の採点器
+    /// 2 番目の候補を常に最良にする偽の採点器。差は 19 nat（実測の打ち間違いは 13〜17 nat、既定の edit_penalty は 10）
     struct Second;
     impl rerank::ScoreBackend for Second {
         fn score(&mut self, _l: &str, _r: Option<&str>, c: &[String]) -> Result<Vec<f32>, String> {
-            Ok((0..c.len()).map(|i| if i == 1 { -1.0 } else { -10.0 }).collect())
+            Ok((0..c.len()).map(|i| if i == 1 { -1.0 } else { -20.0 }).collect())
         }
     }
 
@@ -3264,6 +3283,21 @@ mod typo_integration_tests {
         let out = e.merge_candidates_for_reading_with_context("かんひ", vec!["かんひ".into()], 6, Some("いい"), None);
         assert_eq!(out[0], "感じ", "{out:?}");
         assert!(out.contains(&"かんひ".to_string()));
+    }
+
+    #[test]
+    fn 補正後の読みの表層が窓の外に既にあるなら_2番手を足さずにそれを審判の前へ引き上げる() {
+        let (mut e, _dir) = engine(true);
+        for c in "kanhi".chars() {
+            e.push_char(c);
+        }
+        // 「感じ」は jinen の 6 番目（max_candidates 6 の窓の外 = 添字 6）。かんじ→感じ の補正はこれを引き上げる
+        let llm: Vec<String> = ["官費", "韓妃", "完非", "寛飛", "肝脾", "韓非", "感じ"].iter().map(|s| s.to_string()).collect();
+        let out = e.merge_candidates_for_reading_with_context("かんひ", llm, 40, Some("いい"), None);
+        assert_eq!(out.iter().filter(|s| *s == "感じ").count(), 1, "{out:?}");
+        // 窓は元 6 個（かんひ は辞書に無いので llm の 6 個）+ 補正 1 個。Second は 2 番目を最良にするので
+        // 感じ は末尾ではなく採点ブロック（先頭 7 個）の中にいる
+        assert!(out.iter().position(|s| s == "感じ").unwrap() < 7, "{out:?}");
     }
 
     #[test]

@@ -197,8 +197,10 @@ pub fn min_segments(reading: &str, has: &dyn Fn(&str) -> bool) -> Option<usize> 
 }
 
 /// 補正後の読みを作る。`units` は `input_log` の romaji ユニット、`original` は元の読み。
-/// 辞書で分割できるものだけ残し、（区切り数, 編集コスト, 読み）の順に並べて `max` 個返す。同じ読みは最小コストの 1 つに畳む。
-pub fn alternatives(units: &[String], original: &str, rules: &[Rule], max: usize, has: &dyn Fn(&str) -> bool) -> Vec<Alt> {
+/// 辞書で分割できるものだけ残し、（区切り数, 編集コスト, `rank`, 読み）の順に並べて `max` 個返す。同じ読みは最小コストの 1 つに畳む。
+/// `rank` は読みの頻度の代わり（mozc の cost。小さいほど頻出）。同点を読みの文字順で切ると
+/// 「きあき」の補正で「きかい」が「いかき」に負けて落ちるので、頻度で切る
+pub fn alternatives(units: &[String], original: &str, rules: &[Rule], max: usize, has: &dyn Fn(&str) -> bool, rank: &dyn Fn(&str) -> u16) -> Vec<Alt> {
     if units.is_empty() || max == 0 {
         return Vec::new();
     }
@@ -225,6 +227,7 @@ pub fn alternatives(units: &[String], original: &str, rules: &[Rule], max: usize
         a.segments
             .cmp(&b.segments)
             .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+            .then(rank(&a.reading).cmp(&rank(&b.reading)))
             .then(a.reading.cmp(&b.reading))
     });
     alts.truncate(max);
@@ -244,6 +247,20 @@ mod tests {
         move |r| words.contains(&r)
     }
 
+    /// 頻度の情報なし（全部同点）
+    fn flat(_: &str) -> u16 {
+        0
+    }
+
+    #[test]
+    fn 同じ区切り数と編集コストなら_rank_が小さい_頻出の_読みが先に来る() {
+        // きあき → 入れ替えで かいき と きかい（どちらも 1 区切り・コスト 1）。文字順なら かいき が先
+        let d = dict(&["かいき", "きかい"]);
+        let rank = |r: &str| if r == "きかい" { 100u16 } else { 5000u16 };
+        let alts = alternatives(&units(&["ki", "a", "ki"]), "きあき", &[Rule::TransposeChar], 1, &d, &rank);
+        assert_eq!(alts.iter().map(|a| a.reading.as_str()).collect::<Vec<_>>(), vec!["きかい"]);
+    }
+
     #[test]
     fn ローマ字列は読みに戻り_未変換が残るものは捨てる() {
         assert_eq!(romaji_to_reading("kanjiniya").as_deref(), Some("かんじにや"));
@@ -256,7 +273,7 @@ mod tests {
     fn 隣接ユニットの入れ替えで_じ_と_に_の取り違えが直る() {
         let u = units(&["ka", "n", "ni", "ji", "ya"]);
         let d = dict(&["かんじ", "に", "や", "かん"]);
-        let alts = alternatives(&u, "かんにじや", &Rule::ALL, 4, &d);
+        let alts = alternatives(&u, "かんにじや", &Rule::ALL, 4, &d, &flat);
         let top = alts.first().expect("candidate");
         assert_eq!(top.reading, "かんじにや");
         assert_eq!(top.rule, Rule::TransposeUnit);
@@ -266,19 +283,19 @@ mod tests {
     #[test]
     fn 二重打ちと抜けと隣キーが編集距離1で直る() {
         let d = dict(&["かんじ"]);
-        let double = alternatives(&units(&["ka", "n", "n", "ji"]), "かんんじ", &[Rule::Double], 4, &d);
+        let double = alternatives(&units(&["ka", "n", "n", "ji"]), "かんんじ", &[Rule::Double], 4, &d, &flat);
         assert_eq!(double[0].reading, "かんじ");
-        let drop = alternatives(&units(&["ka", "ji"]), "かじ", &[Rule::Drop], 4, &d);
+        let drop = alternatives(&units(&["ka", "ji"]), "かじ", &[Rule::Drop], 4, &d, &flat);
         assert_eq!(drop[0].reading, "かんじ");
         // kanhi → kanji（h の隣は j）
-        let adj = alternatives(&units(&["ka", "n", "hi"]), "かんひ", &[Rule::AdjacentKey], 4, &d);
+        let adj = alternatives(&units(&["ka", "n", "hi"]), "かんひ", &[Rule::AdjacentKey], 4, &d, &flat);
         assert_eq!(adj[0].reading, "かんじ");
     }
 
     #[test]
     fn 元の読みと辞書で分割できない読みは出ない() {
         let d = dict(&["かんじ", "に", "や"]);
-        let alts = alternatives(&units(&["ka", "n", "ji", "ni", "ya"]), "かんじにや", &Rule::ALL, 10, &d);
+        let alts = alternatives(&units(&["ka", "n", "ji", "ni", "ya"]), "かんじにや", &Rule::ALL, 10, &d, &flat);
         assert!(alts.iter().all(|a| a.reading != "かんじにや"));
         // 「かんにじや」は かん が無く、1 かなの じ は助詞でないので分割できない
         assert!(alts.iter().all(|a| a.reading != "かんにじや"), "{alts:?}");
@@ -288,7 +305,7 @@ mod tests {
     fn 分割数が少ない読みが先に来て_上限で切れる() {
         let d = dict(&["きかい", "き", "かい", "か", "い"]);
         // 「きかい」自体は元。隣キーの候補が多数出るが、辞書で分割できるものだけ残る
-        let alts = alternatives(&units(&["ki", "ka", "i"]), "きかい", &Rule::ALL, 2, &d);
+        let alts = alternatives(&units(&["ki", "ka", "i"]), "きかい", &Rule::ALL, 2, &d, &flat);
         assert!(alts.len() <= 2);
         for w in alts.windows(2) {
             assert!(w[0].segments <= w[1].segments);

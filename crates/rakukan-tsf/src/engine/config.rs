@@ -107,7 +107,7 @@ pub struct TypoConfig {
 
 impl Default for TypoConfig {
     fn default() -> Self {
-        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 2.0, word_max_chars: 8 }
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8 }
     }
 }
 
@@ -890,9 +890,10 @@ enabled = false
 # 誤入力補正（開発中）。ローマ字の打ち間違い（隣キー・二重打ち・抜け・入れ替え）を直した読みの候補を
 # 候補窓に混ぜ、[rerank] の LM が文脈で並べる。[rerank] enabled = true も要る。既定 off
 enabled = false
-# 候補に混ぜる補正後の読みの数、編集コストの係数（大きいほど補正候補が上に来にくい）、対象にする読みの長さ
+# 候補に混ぜる補正後の読みの数、編集コストの係数（nat。補正候補は元の候補よりこの分だけ LM の確信が
+# 高くないと上に来ない。10 = 約 2 万倍）、対象にする読みの長さ
 # max_alternatives = 4
-# edit_penalty = 2.0
+# edit_penalty = 10.0
 # word_max_chars = 8
 # log = true で、Backspace で消して打ち直した打鍵列を %LOCALAPPDATA%\rakukan\typo.log に残す
 # （補正規則の重みを決める計測用。確定した文は書かない）
