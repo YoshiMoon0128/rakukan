@@ -138,6 +138,18 @@ impl MozcDict {
         results
     }
 
+    /// 読みのエントリの cost だけを並び順に返す（表層の文字列は作らない）。
+    /// 誤入力補正は 1 打鍵で数百の読みを引くので、`lookup` が全エントリの表層を作る分が重い。
+    pub fn costs(&self, reading: &str) -> Vec<u16> {
+        let Some(idx) = self.binary_search(reading) else {
+            return vec![];
+        };
+        let (entries_start, n_tokens) = self.index_entry(idx);
+        (0..n_tokens as usize)
+            .map(|i| u16_le(&self.mmap, self.entries_off + (entries_start as usize + i) * ENTRY_RECORD_SIZE + 6))
+            .collect()
+    }
+
     /// ユニーク読み数
     pub fn n_readings(&self) -> usize {
         self.n_readings as usize

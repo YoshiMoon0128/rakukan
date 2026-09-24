@@ -538,10 +538,9 @@ impl DictStore {
     /// 誤入力補正が、同じ編集コストの補正後の読みを頻度で並べるのに使う
     pub fn dict_top_cost(&self, reading: &str) -> Option<u16> {
         let mozc = self.inner.mozc.as_ref()?;
-        mozc.lookup(reading, u16::MAX as usize)
+        mozc.costs(reading)
             .into_iter()
-            .find(|(_, cost)| cost_band::classify(*cost) == cost_band::Class::Normal)
-            .map(|(_, cost)| cost)
+            .find(|cost| cost_band::classify(*cost) == cost_band::Class::Normal)
     }
 
     /// ひらがな読みから記号候補（`symbol.tsv` 由来、mozc の行順）を全件返す（Step 12-2）
