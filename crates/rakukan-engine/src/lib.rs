@@ -1372,7 +1372,9 @@ impl RakunEngine {
 
     /// 長い読み（文）の誤入力補正の仕事。語の補正（`append_typo_alternatives`）が扱わない長さで、審判（リランカー）が
     /// 載っているときだけ。BG 変換のワーカーが補正後の読みを作って jinen で文にする（`conv_cache::typo_extras`）。
-    fn sentence_typo_job(&self) -> Option<conv_cache::TypoJob> {
+    /// ライブ変換の打鍵ごとの変換（`n_cands` 1）では補正候補を `LIVE_SENTENCE_ALTS` 本までにする。補正候補 1 本の
+    /// jinen 変換が GPU で 35〜70 ms かかり、4 本だと打鍵に追いつかない（隔離 host の実測、2026-09-24）
+    fn sentence_typo_job(&self, n_cands: usize) -> Option<conv_cache::TypoJob> {
         let t = &self.config.typo;
         if !t.enabled || !t.sentence || self.hiragana_buf.chars().count() <= t.word_max_chars {
             return None;
@@ -1385,7 +1387,8 @@ impl RakunEngine {
         return None;
         let parts = self.sentence_parts()?;
         let store = self.dict_store.clone()?;
-        Some(conv_cache::TypoJob { parts, store, max: t.max_alternatives })
+        let max = if n_cands <= 1 { t.max_alternatives.min(LIVE_SENTENCE_ALTS) } else { t.max_alternatives };
+        Some(conv_cache::TypoJob { parts, store, max })
     }
 
     /// 今の読みの文の誤入力補正で作る補正後の読みと編集コスト（調査用。変換経路は `sentence_typo_job` を使う）。
@@ -1686,7 +1689,7 @@ impl RakunEngine {
         }
 
         // 先頭ラテン語ランを戻した読みは打鍵と 1 対 1 にならないので、文の補正はしない
-        let typo = if conv_reading == hiragana { self.sentence_typo_job() } else { None };
+        let typo = if conv_reading == hiragana { self.sentence_typo_job(n_cands) } else { None };
         if let Some(conv) = self.kanji.take() {
             match conv_cache::start(
                 hiragana,
@@ -1794,6 +1797,9 @@ impl RakunEngine {
         models
     }
 }
+
+/// ライブ変換の打鍵ごとの BG 変換で作る文の補正候補の上限（`RakunEngine::sentence_typo_job`）
+const LIVE_SENTENCE_ALTS: usize = 3;
 
 /// 文の誤入力補正の候補を `merged` の末尾に、既にある表層を除いて `max` 個まで足す。戻りは足した数。
 #[cfg(feature = "rerank")]
