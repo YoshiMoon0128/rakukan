@@ -1,6 +1,6 @@
 //! composition 周辺のテキストを読む（同音異義語リランカーの左右の文脈）。
 //!
-//! 変換キーを押した時点で、composition の直前 `left_chars` 文字と直後 `right_chars` 文字を
+//! 変換キーを押した時点（ライブ変換では composition ごとに最初の 1 回）で、composition の直前 `left_chars` 文字と直後 `right_chars` 文字を
 //! `ITfRange::GetText` で読み、`RpcEngine::set_surrounding_context` に預ける。以降の
 //! `merge_candidates_for_reading` はこの文脈を添えてホストへ送り、engine 側のリランカーが
 //! 辞書候補を並べ替える。確定・リセットで文脈は捨てる（`RpcEngine` 側）。
@@ -39,6 +39,14 @@ pub fn read_counts() -> (u32, u32) {
 
 /// `[rerank].enabled` のときだけ composition 周辺のテキストを読み、engine ハンドルに預ける。
 /// 読めなかったときも預け直す（前回の Space の文脈を残さないため）。
+/// ライブ変換用。この composition でまだ読んでいなければ読む。左右の文脈は composition の間は
+/// 変わらないので、打鍵ごとに edit session を張らない。
+pub(crate) fn refresh_surrounding_context_once(ctx: &ITfContext, tid: u32, engine: &DynEngine) {
+    if !engine.has_surrounding_context() {
+        refresh_surrounding_context(ctx, tid, engine);
+    }
+}
+
 pub(super) fn refresh_surrounding_context(ctx: &ITfContext, tid: u32, engine: &DynEngine) {
     let cfg = crate::engine::config::current_config().rerank;
     if !cfg.enabled {

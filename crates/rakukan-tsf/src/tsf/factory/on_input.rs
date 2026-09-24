@@ -489,10 +489,11 @@ impl super::TextServiceFactory_Impl {
             sess.sync_preedit_reading(&reading);
         }
         let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &reading);
+        // live_input_notify が engine を try_lock して文脈を読むので、先に手放す
+        drop(guard);
         if live_ready {
             candidate_window::live_input_notify(&ctx, tid);
         }
-        drop(guard);
         update_composition(ctx, tid, sink, preedit)?;
         Ok(true)
     }

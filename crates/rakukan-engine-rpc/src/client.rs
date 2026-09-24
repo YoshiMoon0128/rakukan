@@ -509,6 +509,11 @@ impl RpcEngine {
         }
     }
 
+    /// この composition で文脈を読みに行ったか（読めなかった回も含む）。確定・リセットで false に戻る。
+    pub fn has_surrounding_context(&self) -> bool {
+        self.surrounding.lock().map(|g| g.is_some()).unwrap_or(false)
+    }
+
     fn surrounding_context(&self) -> Option<SurroundingContext> {
         self.surrounding.lock().ok().and_then(|g| g.clone())
     }

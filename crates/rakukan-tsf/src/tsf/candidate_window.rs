@@ -1965,6 +1965,15 @@ pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid
     }
     let debounce_ms = cfg.live_conversion.debounce_ms;
 
+    // プレビューもリランカーがアプリの左右の文脈で採点するように、composition ごとに 1 回読む。
+    // 読まないと engine は左文脈に確定文（committed）を使い、右文脈は無しになる。
+    // on_input（キーイベントのシンク内）から呼ばれるので TF_ES_SYNC の読み取りが通る
+    if let Ok(g) = crate::engine::state::engine_try_get()
+        && let Some(engine) = g.as_ref()
+    {
+        crate::tsf::factory::context_read::refresh_surrounding_context_once(ctx, tid, engine);
+    }
+
     // デバウンス時刻をリセット
     let now = current_millis();
     crate::tsf::live_session::store_last_input_ms(now);
