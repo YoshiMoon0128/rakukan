@@ -25,6 +25,7 @@ const TYPOS: &[(&str, &str, &str)] = &[
     ("隣 e→r", "kyounotenkihaharenotiamrdesu", "kyounotenkihaharenotiamedesu"),
     ("隣 o→p", "kaigisitunoyoyakuwpsitekudasai", "kaigisitunoyoyakuwositekudasai"),
     ("二重 k", "tinaminikkonohonnhaomosiroidesu", "tinaminikonohonnhaomosiroidesu"),
+    ("読点のあと 余計 j", "raisyuunoteireikaigideha,konnkinoshinntyokutokadaiwomatometehjappyousuruyoteidesu", "raisyuunoteireikaigideha,konnkinoshinntyokutokadaiwomatometehappyousuruyoteidesu"),
 ];
 
 /// 正しく打った文（余計な直しを出さないか）

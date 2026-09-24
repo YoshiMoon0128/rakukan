@@ -110,7 +110,7 @@ pub fn romaji_to_reading(romaji: &str) -> Option<String> {
     Some(out)
 }
 
-fn is_kana(c: char) -> bool {
+pub(crate) fn is_kana(c: char) -> bool {
     matches!(c, '\u{3041}'..='\u{3096}' | 'ー')
 }
 

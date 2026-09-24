@@ -1345,15 +1345,19 @@ impl RakunEngine {
     }
 
     /// 今の composition の打鍵を、ローマ字の区間と固定の区間（記号・数字・直接入力）に分けて返す。
+    /// 句読点はローマ字の変換表を通る（`,` → 「、」）が、直した打鍵列をかなに戻すと捨てられる（`romaji_to_reading`）ので
+    /// 固定の区間にする。読みに残った英字（打ち間違い）はローマ字の区間に残す。
     /// `force_preedit` で表示を差し替えた後（detach）や、区間の出力を繋いでも今の読みにならないときは None。
     fn sentence_parts(&self) -> Option<Vec<typo::Part>> {
         let entries = &self.input_log[self.log_detached_at.min(self.input_log.len())..];
         if entries.is_empty() {
             return None;
         }
+        let punct = |s: &str| !s.is_empty() && s.chars().all(|c| !typo::is_kana(c) && !c.is_alphanumeric());
         let mut parts: Vec<typo::Part> = Vec::new();
         for e in entries {
-            match (e.kind == InputKind::Romaji, parts.last_mut()) {
+            let romaji = e.kind == InputKind::Romaji && !punct(&e.output);
+            match (romaji, parts.last_mut()) {
                 (true, Some(typo::Part::Romaji { units, output })) => {
                     units.push(e.typed.clone());
                     output.push_str(&e.output);
@@ -2457,6 +2461,25 @@ mod passthrough_sync_tests {
         let log = e.romaji_log_str();
         let pending = e.current_preedit().pending_romaji.clone();
         assert_eq!(format!("{}{}", log, pending), "qwrty");
+    }
+}
+
+#[cfg(test)]
+mod sentence_parts_tests {
+    use super::*;
+
+    #[test]
+    fn 読点はローマ字の区間から外して固定の区間にし_残った英字はローマ字の区間に残す() {
+        let mut e = RakunEngine::new(EngineConfig::default());
+        for c in "deha,tehjappyou".chars() {
+            e.push_char(c);
+        }
+        let parts = e.sentence_parts().expect("parts");
+        let outputs: Vec<(&str, bool)> = parts
+            .iter()
+            .map(|p| (p.output(), matches!(p, typo::Part::Romaji { .. })))
+            .collect();
+        assert_eq!(outputs, vec![("では", true), ("、", false), ("てhじゃっぴょう", true)]);
     }
 }
 

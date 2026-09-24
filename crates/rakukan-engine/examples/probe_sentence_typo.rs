@@ -11,9 +11,17 @@ fn main() -> anyhow::Result<()> {
     let store = DictStore::load(None, Some(std::path::Path::new(&dict)), None)?;
     let mut config = EngineConfig::default();
     config.typo.enabled = true;
+    if std::env::var("FULLWIDTH").is_ok() {
+        config.alpha_width = rakukan_engine::AlphaWidth::Fullwidth;
+    }
     config.typo.max_alternatives = std::env::var("MAX_ALTS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     // （ラベル, ローマ字）。打ち間違いは本人の typo.log で多かった型（余計なキー 1 つ）と、4 種の誤り
     let cases = [
+        ("b1", "matometehjappyousuru"),
+        ("b2", "kadaiwomatometehjappyousuruyoteidesu"),
+        ("b3", "konnkinoshinntyokutokadaiwomatometehjappyousuru"),
+        ("b4", "raisyuunoteireikaigideha,matometehjappyousuru"),
+        ("余計 j 長文", "raisyuunoteireikaigideha,konnkinoshinntyokutokadaiwomatometehjappyousuruyoteidesu"),
         ("ok 読点", "sirabetemitakeredo,geninnhamadawakarimasenndesita"),
         ("ok 長文", "raisyuunoteireikaigidehakonnkinoshinntyokutokadaiwomatometehappyousuruyoteidesu"),
         ("ok 会議", "asitanokaiginosiryouwojunbisiteokimasu"),
