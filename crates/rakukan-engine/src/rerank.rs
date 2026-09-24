@@ -195,6 +195,27 @@ pub fn target_indices(merged: &[String], learn: &[String], user: &[String], max_
     (pinned..pinned + n).chain(orig_len..orig_len + extra).collect()
 }
 
+/// 候補がこれ以上の文字数の頭を共有していたら、その頭は左文脈に回して採点する（`shared_head`）
+const SHARED_HEAD_MIN_CHARS: usize = 4;
+
+/// 全候補に共通する頭（文字単位）。どの候補にも 1 文字以上残る長さまで。`SHARED_HEAD_MIN_CHARS` 未満なら 0。
+///
+/// 点は log P(候補 | 左文脈) で、候補どうしの差（log_softmax）だけが順位に効く。共通の頭の log P は全候補に同じだけ
+/// 足されるので、頭を左文脈に回して残りだけを採点しても順位は変わらない（トークンの区切れ目がずれる分だけ動く）。
+/// 文の補正候補（直した場所だけが違う長い文）で、採点する token が数分の 1 になる。
+pub fn shared_head(candidates: &[String]) -> usize {
+    let Some((first, rest)) = candidates.split_first() else { return 0 };
+    let first: Vec<char> = first.chars().collect();
+    let mut n = first.len();
+    for c in rest {
+        let common = c.chars().zip(&first).take_while(|(a, b)| a == *b).count();
+        // 残りが空の候補を作らない
+        n = n.min(common).min(c.chars().count().saturating_sub(1));
+    }
+    n = n.min(first.len().saturating_sub(1));
+    if n < SHARED_HEAD_MIN_CHARS { 0 } else { n }
+}
+
 /// 文字列の末尾 `n` 文字。
 pub fn tail_chars(s: &str, n: usize) -> String {
     let total = s.chars().count();
@@ -248,6 +269,10 @@ impl Scorer {
             .with_n_batch(2048)
             .with_n_ubatch(512)
             .with_n_seq_max(self.n_seq_max)
+            // 左文脈の KV を候補の系列へ写す copy_kv_cache_seq を、中身の複製ではなく印の付け替えにする。
+            // 統合しないと系列ごとに KV を持ち（n_ctx も系列数で割られる）、Vulkan では長い左文脈の複製が
+            // 採点の大半を占めた（文の補正候補 3 本で 400〜570 ms、2026-09-24 の隔離 host）
+            .with_kv_unified(true)
             .with_n_threads(self.n_threads)
             .with_n_threads_batch(self.n_threads);
         let ctx = self.model.new_context(self.backend, cparams).map_err(|e| e.to_string())?;
@@ -587,9 +612,13 @@ impl Reranker {
             tracing::debug!("rerank: skipped reason=single_target targets={}", idx.len());
             return merged;
         }
-        let left_tail = tail_chars(left, self.cfg.left_chars);
         let targets: Vec<String> = idx.iter().map(|&i| merged[i].clone()).collect();
         let target_costs: Vec<f32> = idx.iter().map(|&i| edit_costs.get(i).copied().unwrap_or(0.0)).collect();
+        // 共通の頭は左文脈に回す（順位は変わらない）。左文脈の長さ left_chars は頭を足したあとで切る
+        let head = shared_head(&targets);
+        let head_str: String = targets[0].chars().take(head).collect();
+        let left_tail = tail_chars(&format!("{left}{head_str}"), self.cfg.left_chars);
+        let scored: Vec<String> = targets.iter().map(|t| t.chars().skip(head).collect()).collect();
 
         let mut chan = match self.chan.lock() {
             Ok(g) => g,
@@ -601,7 +630,7 @@ impl Reranker {
         }
         let id = chan.next_id;
         chan.next_id += 1;
-        let job = Job { id, left: left_tail, right: right.map(str::to_owned), candidates: targets.clone() };
+        let job = Job { id, left: left_tail, right: right.map(str::to_owned), candidates: scored };
         if chan.tx.send(job).is_err() {
             return merged;
         }
@@ -771,6 +800,36 @@ mod tests {
 
     fn fake(gate: Option<std::sync::mpsc::Receiver<()>>) -> Result<Box<dyn ScoreBackend>, String> {
         Ok(Box::new(Fake { gate }))
+    }
+
+    #[test]
+    fn shared_head_は4文字以上の共通の頭だけを返し_どの候補にも1文字以上残す() {
+        assert_eq!(shared_head(&s(&["機械", "機会"])), 0);
+        assert_eq!(shared_head(&s(&["来週の会議で発表", "来週の会議ではっぴょう"])), 6);
+        // 片方が他方の頭そのものでも、残りが空にならない長さで止める
+        assert_eq!(shared_head(&s(&["来週の会議", "来週の会議で"])), 4);
+    }
+
+    /// 渡された左文脈と候補を書き留めて、2 番目を最良にする偽の採点器
+    struct Record(std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>);
+
+    impl ScoreBackend for Record {
+        fn score(&mut self, left: &str, _right: Option<&str>, candidates: &[String]) -> Result<Vec<f32>, String> {
+            self.0.lock().unwrap().push((left.to_string(), candidates.to_vec()));
+            Ok((0..candidates.len()).map(|i| if i == 1 { -1.0 } else { -10.0 }).collect())
+        }
+    }
+
+    #[test]
+    fn 候補が共有する長い頭は左文脈に回して残りだけを採点し_順位は元の文字列で返す() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), move || Ok(Box::new(Record(log)) as Box<dyn ScoreBackend>));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+        let out = rr.rerank("今日は", None, s(&["来週の会議でｈじゃ", "来週の会議では"]), &[], &[]);
+        assert_eq!(out, s(&["来週の会議では", "来週の会議でｈじゃ"]));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0], ("今日は来週の会議で".to_string(), s(&["ｈじゃ", "は"])));
     }
 
     #[test]
