@@ -40,6 +40,15 @@ use crate::{DigitCandidateKind, default_digit_candidates_order};
 
 // ─── リクエスト ────────────────────────────────────────────────────────────────
 
+/// 文の誤入力補正の仕事（`RakunEngine::bg_start` が長い読みのときに積む）。
+/// ワーカーが本来の変換のあとで補正後の読みを作り、jinen で文に変換し直して `typo_extras` に置く。
+/// 辞書を引く量が多いので、打鍵を処理するスレッドではなくワーカーでやる。
+pub struct TypoJob {
+    pub parts: Vec<crate::typo::Part>,
+    pub store: rakukan_dict::DictStore,
+    pub max: usize,
+}
+
 /// ワーカーへの変換リクエスト（single-slot 上書き式キュー）
 struct Request {
     /// TSF 側の打鍵そのままの読みと照合するキャッシュキー。
@@ -52,6 +61,7 @@ struct Request {
     digit_candidates_order: Vec<DigitCandidateKind>,
     alpha_fullwidth_first: bool,
     symbol_fullwidth_first: bool,
+    typo: Option<TypoJob>,
 }
 
 // ─── キャッシュ状態 ────────────────────────────────────────────────────────────
@@ -152,6 +162,7 @@ fn worker_loop(cache: Arc<Cache>) {
         let alpha_fullwidth_first = req.alpha_fullwidth_first;
         let symbol_fullwidth_first = req.symbol_fullwidth_first;
         let converter = req.converter;
+        let typo = req.typo;
 
         let t = std::time::Instant::now();
         let (converter, candidates, failed) =
@@ -185,7 +196,26 @@ fn worker_loop(cache: Arc<Cache>) {
                 }
             };
 
+        let extras = match (&typo, failed) {
+            (Some(job), false) => sentence_extras(
+                &cache,
+                &converter,
+                job,
+                &candidates,
+                &committed,
+                &digit_candidates_order,
+                alpha_fullwidth_first,
+                symbol_fullwidth_first,
+            ),
+            _ => Vec::new(),
+        };
+
         let mut inner = cache.inner.lock().unwrap();
+        if inner.pending.is_none()
+            && let Ok(mut slot) = EXTRAS.lock()
+        {
+            *slot = Some((key.clone(), extras));
+        }
         if let Some(pending) = inner.pending.as_mut() {
             // 変換中に新しいリクエストが来ていた場合、
             // warm-up 済み converter を次のリクエストに引き渡す（再初期化コストを節約）
@@ -200,6 +230,81 @@ fn worker_loop(cache: Arc<Cache>) {
         }
         // Done 遷移を wait_done_timeout に通知
         cache.cond.notify_all();
+    }
+}
+
+/// 文の誤入力補正の候補（表層, 編集コスト）。キーは読み。最後に完了した変換の分だけを持つ。
+static EXTRAS: LazyLock<Mutex<Option<(String, Vec<(String, f32)>)>>> = LazyLock::new(|| Mutex::new(None));
+
+/// 補正後の読みを作り、それぞれを jinen で 1 候補だけ文に変換する。次の打鍵のリクエストが来ていたら打ち切る
+/// （その結果は Done にならず使われない）。本来の候補と同じ表層は足さない。
+#[allow(clippy::too_many_arguments)]
+fn sentence_extras(
+    cache: &Cache,
+    converter: &KanaKanjiConverter,
+    job: &TypoJob,
+    main: &[String],
+    committed: &str,
+    digit_candidates_order: &[DigitCandidateKind],
+    alpha_fullwidth_first: bool,
+    symbol_fullwidth_first: bool,
+) -> Vec<(String, f32)> {
+    let t = std::time::Instant::now();
+    let word_cost = |r: &str| job.store.dict_top_cost(r);
+    let alts = crate::typo::sentence_alternatives(&job.parts, &crate::typo::Rule::ALL, job.max, &word_cost);
+    let dict_us = t.elapsed().as_micros();
+    let mut out: Vec<(String, f32)> = Vec::new();
+    for alt in &alts {
+        if cache.inner.try_lock().map(|g| g.pending.is_some()).unwrap_or(false) {
+            tracing::debug!("typo: sentence extras aborted by newer request");
+            break;
+        }
+        let converted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::digits::convert_with_digit_protection(
+                converter,
+                &alt.reading,
+                committed,
+                1,
+                digit_candidates_order,
+                alpha_fullwidth_first,
+                symbol_fullwidth_first,
+            )
+        }));
+        let Ok(Ok(cands)) = converted else { continue };
+        let Some(surface) = cands.into_iter().next() else { continue };
+        if main.contains(&surface) || out.iter().any(|(s, _)| *s == surface) {
+            continue;
+        }
+        tracing::debug!(
+            "typo: sentence extra reading={:?} rule={} surface={:?}",
+            alt.reading,
+            alt.rule.name(),
+            surface
+        );
+        out.push((surface, alt.cost));
+    }
+    tracing::debug!(
+        "typo: sentence alts={} extras={} dict={} us total={} ms",
+        alts.len(),
+        out.len(),
+        dict_us,
+        t.elapsed().as_millis()
+    );
+    out
+}
+
+/// ワーカーを通さずに補正候補を置く（engine のマージのテスト用）。
+#[cfg(test)]
+pub(crate) fn set_typo_extras(key: &str, extras: Vec<(String, f32)>) {
+    *EXTRAS.lock().unwrap() = Some((key.to_string(), extras));
+}
+
+/// `key` の読みの変換に付いた文の誤入力補正の候補（表層, 編集コスト）。無ければ空。
+pub fn typo_extras(key: &str) -> Vec<(String, f32)> {
+    let Ok(slot) = EXTRAS.lock() else { return Vec::new() };
+    match slot.as_ref() {
+        Some((k, extras)) if k == key => extras.clone(),
+        _ => Vec::new(),
     }
 }
 
@@ -224,6 +329,7 @@ pub fn start(
     digit_candidates_order: Vec<DigitCandidateKind>,
     alpha_fullwidth_first: bool,
     symbol_fullwidth_first: bool,
+    typo: Option<TypoJob>,
 ) -> Option<KanaKanjiConverter> {
     if hiragana.is_empty() {
         return Some(converter);
@@ -260,6 +366,7 @@ pub fn start(
         },
         alpha_fullwidth_first,
         symbol_fullwidth_first,
+        typo,
     });
     cache.cond.notify_one();
     None

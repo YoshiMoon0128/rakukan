@@ -7,6 +7,9 @@
 //!
 //! 審判（どれが本命か）は LM のリランカーがやる。ここの仕事は「数を絞って無意味を落とす」まで。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use crate::romaji::RomajiConverter;
 
 /// 補正の規則。編集コストの重みは規則ごとの定数から始め、typo ログの実測で置き換える。
@@ -22,10 +25,12 @@ pub enum Rule {
     Double,
     /// 抜けの挿入（"kaji" → "kanji"）
     Drop,
+    /// 余計な 1 字の削除（"hunnkakarurmi" → "hunnkakarumi"）。隣のキーを一緒に押した打ち間違いで、読みに英字が残りやすい
+    Extra,
 }
 
 impl Rule {
-    pub const ALL: [Rule; 5] = [Rule::TransposeUnit, Rule::TransposeChar, Rule::AdjacentKey, Rule::Double, Rule::Drop];
+    pub const ALL: [Rule; 6] = [Rule::TransposeUnit, Rule::TransposeChar, Rule::AdjacentKey, Rule::Double, Rule::Drop, Rule::Extra];
 
     pub fn cost(self) -> f32 {
         match self {
@@ -34,6 +39,7 @@ impl Rule {
             Rule::AdjacentKey => 1.0,
             Rule::Double => 0.7,
             Rule::Drop => 1.3,
+            Rule::Extra => 1.0,
         }
     }
 
@@ -44,6 +50,7 @@ impl Rule {
             Rule::AdjacentKey => "adjacent_key",
             Rule::Double => "double",
             Rule::Drop => "drop",
+            Rule::Extra => "extra",
         }
     }
 }
@@ -161,6 +168,17 @@ pub fn generate(units: &[String], rules: &[Rule]) -> Vec<(String, Rule)> {
                     }
                 }
             }
+            Rule::Extra => {
+                for i in 0..chars.len() {
+                    // 同じ字の連続は Double が受け持つ
+                    if i > 0 && chars[i] == chars[i - 1] {
+                        continue;
+                    }
+                    let mut c = chars.clone();
+                    c.remove(i);
+                    out.push((c.iter().collect(), rule));
+                }
+            }
         }
     }
     out
@@ -234,6 +252,187 @@ pub fn alternatives(units: &[String], original: &str, rules: &[Rule], max: usize
     alts
 }
 
+/// 文の打鍵列の区間。直すのはローマ字の区間だけで、記号・数字・直接入力は固定のまま読みに入る。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Part {
+    /// ローマ字の打鍵（`input_log` の 1 かなぶんの `typed`）と、この区間が読みに足した文字列
+    Romaji { units: Vec<String>, output: String },
+    Fixed(String),
+}
+
+impl Part {
+    pub fn output(&self) -> &str {
+        match self {
+            Part::Romaji { output, .. } => output,
+            Part::Fixed(s) => s,
+        }
+    }
+}
+
+/// 文の中の 1 か所を直した読み。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentenceAlt {
+    pub reading: String,
+    pub rule: Rule,
+    pub cost: f32,
+    /// 直した場所の前後で `cover` の点がどれだけ下がったか
+    pub gain: u32,
+    /// 直した場所の前後を覆った語の mozc コストの合計（小さいほど頻出の語で説明できた）
+    pub word_cost: u32,
+    /// 読みに残った英字の近くで余計な 1 字を消した直し。typo.log の実測では、英字が残る打ち間違いの多くが
+    /// 隣のキーを一緒に押したもの（`hunnkakarurmi` `jasonohoukjou` `wqo`）なので、並べるときに先頭へ置く
+    pub latin_extra: bool,
+}
+
+/// 辞書のどの語にも入らない文字 1 字の点。語 1 つは 1 点。打ち間違いは辞書に無い切れ端を作るので重く数える
+const UNCOVERED: u32 = 3;
+/// 辞書の読みとして探す最長のかな数
+const MAX_WORD_CHARS: usize = 12;
+/// 直した場所の前後で点を比べる幅（かな数）
+const REGION_PAD: usize = 6;
+/// 点がこれ以上下がった直しだけ残す。語の区切りが 1 つ減るだけ（1 点）の直しは残さない
+const MIN_GAIN: u32 = 2;
+/// 並べるときの下がり幅の頭打ち。語に入らない文字を 1 つ消せば十分で、それ以上の差は mozc が持つ切れ端
+/// （「てく」「うる」）の当たり外れで決まり当てにならない（「でてくyる」で「でてくうる」が「でてくる」を上回った）
+const GAIN_CAP: u32 = UNCOVERED;
+
+/// 読みを辞書の語で覆ったときの最小の点と、その覆い方で語に入らなかった文字の位置。
+/// 語 1 つは 1 点、句読点などの記号 1 字は 1 点、語に入らないかな・英字 1 字は `UNCOVERED` 点。
+/// 1 かなの語は助詞だけ認める（`min_segments` と同じ理由）。点が同じ覆い方が複数あれば、語の mozc コストの合計が小さい方。
+/// `word_cost(r)` は読み r の語の mozc コスト（辞書に無ければ None）。戻りは（点, 語のコストの合計, 語に入らなかった位置）。
+fn cover(chars: &[char], word_cost: &dyn Fn(&str) -> Option<u16>) -> (u32, u32, Vec<usize>) {
+    let n = chars.len();
+    // best[i] = 先頭 i 字を覆う最小の（点, コスト）、from[i] = (直前の区切り, 語か記号で覆ったか)
+    let mut best = vec![(u32::MAX, u32::MAX); n + 1];
+    let mut from = vec![(0usize, false); n + 1];
+    best[0] = (0, 0);
+    for end in 1..=n {
+        let c = chars[end - 1];
+        let symbol = !(is_kana(c) || c.is_alphanumeric());
+        let (p, w) = best[end - 1];
+        best[end] = (p + if symbol { 1 } else { UNCOVERED }, w);
+        from[end] = (end - 1, symbol);
+        for start in end.saturating_sub(MAX_WORD_CHARS)..end {
+            let (p, w) = best[start];
+            if p == u32::MAX || p + 1 > best[end].0 {
+                continue;
+            }
+            let seg: String = chars[start..end].iter().collect();
+            if end - start == 1 && !PARTICLES.contains(&seg.as_str()) {
+                continue;
+            }
+            if let Some(cost) = word_cost(&seg) {
+                let cand = (p + 1, w + cost as u32);
+                if cand < best[end] {
+                    best[end] = cand;
+                    from[end] = (start, true);
+                }
+            }
+        }
+    }
+    let mut uncovered = Vec::new();
+    let mut i = n;
+    while i > 0 {
+        let (start, covered) = from[i];
+        if !covered {
+            uncovered.push(start);
+        }
+        i = start;
+    }
+    uncovered.reverse();
+    (best[n].0, best[n].1, uncovered)
+}
+
+/// 文（長い読み）の打ち間違いを 1 か所直した読みを作る。`parts` は打鍵列をローマ字の区間と固定の区間に分けたもの。
+///
+/// 読み全体を辞書の語で覆い、語に入らない文字が無ければ何も返さない（正しく打った文はここで終わる）。
+/// 語に入らない文字があれば、その近くを直す編集距離 1 の打鍵列を作り、直した場所の前後 `REGION_PAD` 字で
+/// 点を比べて `MIN_GAIN` 以上下がったものを残す。（英字の近くの余計な 1 字の削除か, `GAIN_CAP` で頭打ちにした下がり幅,
+/// 直した場所の語のコスト, 編集コスト）の順に `max` 個返す。
+/// 審判（LM のリランカー）が文ごと採点するので、ここの仕事は数を絞ることだけ。
+pub fn sentence_alternatives(parts: &[Part], rules: &[Rule], max: usize, word_cost: &dyn Fn(&str) -> Option<u16>) -> Vec<SentenceAlt> {
+    if max == 0 {
+        return Vec::new();
+    }
+    let memo: RefCell<HashMap<String, Option<u16>>> = RefCell::new(HashMap::new());
+    let has = |r: &str| {
+        if let Some(&v) = memo.borrow().get(r) {
+            return v;
+        }
+        let v = word_cost(r);
+        memo.borrow_mut().insert(r.to_string(), v);
+        v
+    };
+    let original: String = parts.iter().map(Part::output).collect();
+    let orig: Vec<char> = original.chars().collect();
+    let (_, _, uncovered) = cover(&orig, &has);
+    if uncovered.is_empty() {
+        return Vec::new();
+    }
+    // 範囲 [lo, hi) の前後 REGION_PAD 字以内に、語に入らない文字があるか
+    let near = |lo: usize, hi: usize| uncovered.iter().any(|&u| u + REGION_PAD >= lo && u < hi + REGION_PAD);
+
+    let mut out: Vec<SentenceAlt> = Vec::new();
+    let mut offset = 0usize;
+    for (pi, part) in parts.iter().enumerate() {
+        let len = part.output().chars().count();
+        let Part::Romaji { units, output } = part else {
+            offset += len;
+            continue;
+        };
+        if !near(offset, offset + len) {
+            offset += len;
+            continue;
+        }
+        let prefix: String = parts[..pi].iter().map(Part::output).collect();
+        let suffix: String = parts[pi + 1..].iter().map(Part::output).collect();
+        for (romaji, rule) in generate(units, rules) {
+            let Some(r) = romaji_to_reading(&romaji) else { continue };
+            if r == *output {
+                continue;
+            }
+            let alt: Vec<char> = prefix.chars().chain(r.chars()).chain(suffix.chars()).collect();
+            // 直した場所 = 元と共通の先頭・末尾を除いた範囲
+            let p = orig.iter().zip(&alt).take_while(|(a, b)| a == b).count();
+            let max_s = orig.len().min(alt.len()) - p;
+            let s = orig.iter().rev().zip(alt.iter().rev()).take(max_s).take_while(|(a, b)| a == b).count();
+            let (o_end, a_end) = (orig.len() - s, alt.len() - s);
+            if !near(p, o_end) {
+                continue;
+            }
+            let lo = p.saturating_sub(REGION_PAD);
+            let (so, _, _) = cover(&orig[lo..(o_end + REGION_PAD).min(orig.len())], &has);
+            let (sa, word_cost, _) = cover(&alt[lo..(a_end + REGION_PAD).min(alt.len())], &has);
+            if so < sa + MIN_GAIN {
+                continue;
+            }
+            let reading: String = alt.iter().collect();
+            let latin_extra = rule == Rule::Extra
+                && orig[lo..(o_end + REGION_PAD).min(orig.len())].iter().any(|c| c.is_ascii_alphabetic());
+            let cand = SentenceAlt { reading, rule, cost: rule.cost(), gain: so - sa, word_cost, latin_extra };
+            match out.iter_mut().find(|a| a.reading == cand.reading) {
+                Some(a) => {
+                    if cand.cost < a.cost {
+                        *a = cand;
+                    }
+                }
+                None => out.push(cand),
+            }
+        }
+        offset += len;
+    }
+    out.sort_by(|a, b| {
+        b.latin_extra
+            .cmp(&a.latin_extra)
+            .then(b.gain.min(GAIN_CAP).cmp(&a.gain.min(GAIN_CAP)))
+            .then(a.word_cost.cmp(&b.word_cost))
+            .then(a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.reading.cmp(&b.reading))
+    });
+    out.truncate(max);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,10 +473,10 @@ mod tests {
         let u = units(&["ka", "n", "ni", "ji", "ya"]);
         let d = dict(&["かんじ", "に", "や", "かん"]);
         let alts = alternatives(&u, "かんにじや", &Rule::ALL, 4, &d, &flat);
-        let top = alts.first().expect("candidate");
-        assert_eq!(top.reading, "かんじにや");
-        assert_eq!(top.rule, Rule::TransposeUnit);
-        assert_eq!(top.segments, 3); // かんじ / に / や
+        // 余計な 1 字の削除でできる「かんじや」（2 区切り）が先に並ぶことがある。どちらが本命かは審判が決める
+        let fixed = alts.iter().find(|a| a.reading == "かんじにや").expect("candidate");
+        assert_eq!(fixed.rule, Rule::TransposeUnit);
+        assert_eq!(fixed.segments, 3); // かんじ / に / や
     }
 
     #[test]
@@ -318,6 +517,68 @@ mod tests {
         assert_eq!(min_segments("かんじにや", &d), Some(3));
         assert_eq!(min_segments("じ", &d), None);
         assert_eq!(min_segments("に", &d), Some(1));
+    }
+
+    /// 偽の mozc: この読みだけがあり、コストは並びの順（先ほど頻出）
+    fn costs(words: &'static [&'static str]) -> impl Fn(&str) -> Option<u16> {
+        move |r| words.iter().position(|w| *w == r).map(|i| 100 * (i as u16 + 1))
+    }
+
+    fn romaji(units_: &[&str], output: &str) -> Part {
+        Part::Romaji { units: units(units_), output: output.to_string() }
+    }
+
+    #[test]
+    fn 文の中の二重打ちが_辞書に無い切れ端を消す直しとして出る() {
+        // ちなみに っこの（k の二重打ち）→ ちなみに この
+        let d = costs(&["ちなみに", "この", "しすてむ"]);
+        let parts = [romaji(&["ti", "na", "mi", "ni", "k", "ko", "no", "si", "su", "te", "mu"], "ちなみにっこのしすてむ")];
+        let alts = sentence_alternatives(&parts, &Rule::ALL, 4, &d);
+        let top = alts.first().expect("candidate");
+        assert_eq!(top.reading, "ちなみにこのしすてむ");
+        assert_eq!(top.rule, Rule::Double);
+    }
+
+    #[test]
+    fn 読みに英字が残る余計なキーは_1字消す直しで出る() {
+        // hunnkakarurmitai（r が余計、2026-09-24 の typo.log）→ ふんかかるみたい
+        let d = costs(&["ふん", "かかる", "みたい"]);
+        let u = ["hu", "nn", "ka", "ka", "ru", "r", "mi", "ta", "i"];
+        let parts = [romaji(&u, "ふんかかるrみたい")];
+        let alts = sentence_alternatives(&parts, &Rule::ALL, 4, &d);
+        let top = alts.first().expect("candidate");
+        assert_eq!(top.reading, "ふんかかるみたい");
+        assert_eq!(top.rule, Rule::Extra);
+    }
+
+    #[test]
+    fn 辞書の語で覆い切れる文には直しを出さない() {
+        let d = costs(&["ちなみに", "この", "しすてむ"]);
+        let parts = [romaji(&["ti", "na", "mi", "ni", "ko", "no", "si", "su", "te", "mu"], "ちなみにこのしすてむ")];
+        assert!(sentence_alternatives(&parts, &Rule::ALL, 4, &d).is_empty());
+    }
+
+    #[test]
+    fn 固定の区間は直さずに読みへ残す() {
+        // するから、 のあとの区間で隣キー（tensai の s を a と打って tenaai = てなあい）
+        let d = costs(&["するから", "として", "てんさい", "なあ"]);
+        let parts = [
+            romaji(&["su", "ru", "ka", "ra"], "するから"),
+            Part::Fixed("、".to_string()),
+            romaji(&["te", "na", "a", "i", "to", "si", "te"], "てなあいとして"),
+        ];
+        let alts = sentence_alternatives(&parts, &Rule::ALL, 4, &d);
+        assert!(alts.iter().any(|a| a.reading == "するから、てんさいとして"), "{alts:?}");
+        assert!(alts.iter().all(|a| a.reading.starts_with("するから、")), "{alts:?}");
+    }
+
+    #[test]
+    fn cover_は語に入らない文字の位置を返し_句読点は罰しない() {
+        let d = costs(&["この", "しすてむ"]);
+        let chars: Vec<char> = "っこの、しすてむ".chars().collect();
+        let (score, _, uncovered) = cover(&chars, &d);
+        assert_eq!(uncovered, vec![0]);
+        assert_eq!(score, UNCOVERED + 1 + 1 + 1);
     }
 
     #[test]

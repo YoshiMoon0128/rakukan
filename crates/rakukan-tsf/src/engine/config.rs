@@ -104,13 +104,15 @@ pub struct TypoConfig {
     pub max_alternatives: usize,
     /// 編集コストの係数（nat）。大きいほど補正候補が上に来にくい
     pub edit_penalty: f32,
-    /// これ以下の読み（かな数）だけ補正する
+    /// これ以下の読み（かな数）だけ語として補正する
     pub word_max_chars: usize,
+    /// それより長い読み（文）も補正する。既定 true
+    pub sentence: bool,
 }
 
 impl Default for TypoConfig {
     fn default() -> Self {
-        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8 }
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8, sentence: true }
     }
 }
 
@@ -118,12 +120,13 @@ impl TypoConfig {
     /// EngineConfig JSON の `"typo"` の値。engine 側 `TypoSettings` のフィールド名に合わせる。
     pub fn to_engine_json(&self) -> String {
         format!(
-            r#"{{"log":{},"enabled":{},"max_alternatives":{},"edit_penalty":{},"word_max_chars":{}}}"#,
+            r#"{{"log":{},"enabled":{},"max_alternatives":{},"edit_penalty":{},"word_max_chars":{},"sentence":{}}}"#,
             self.log,
             self.enabled,
             self.max_alternatives,
             json_number(self.edit_penalty),
-            self.word_max_chars
+            self.word_max_chars,
+            self.sentence
         )
     }
 }
@@ -937,14 +940,17 @@ enabled = false
 # gpu_layers = 0
 
 [typo]
-# 誤入力補正（開発中）。ローマ字の打ち間違い（隣キー・二重打ち・抜け・入れ替え）を直した読みの候補を
+# 誤入力補正（開発中）。ローマ字の打ち間違い（隣キー・二重打ち・抜け・入れ替え・余計な 1 字）を直した読みの候補を
 # 候補窓に混ぜ、[rerank] の LM が文脈で並べる。[rerank] enabled = true も要る。既定 off
 enabled = false
 # 候補に混ぜる補正後の読みの数、編集コストの係数（nat。補正候補は元の候補よりこの分だけ LM の確信が
-# 高くないと上に来ない。10 = 約 2 万倍）、対象にする読みの長さ
+# 高くないと上に来ない。10 = 約 2 万倍）、語として補正する読みの長さ
 # max_alternatives = 4
 # edit_penalty = 10.0
 # word_max_chars = 8
+# word_max_chars より長い読み（文）も補正する。辞書の語に入らない切れ端（読みに残った英字など）の近くを
+# 1 か所直した読みを jinen で文に変換し直し、元の 1 位と並べて LM が決める。ライブ変換のプレビューにも効く
+# sentence = true
 # log = true で、Backspace で消して打ち直した打鍵列を %LOCALAPPDATA%\rakukan\typo.log に残す
 # （補正規則の重みを決める計測用。確定した文は書かない）
 log = false

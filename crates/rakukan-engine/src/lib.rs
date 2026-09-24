@@ -285,15 +285,17 @@ pub struct TypoSettings {
     pub max_alternatives: usize,
     /// 事前分布に足す編集コストの係数（nat）。補正候補が元の候補を追い越すには LM が e^μ 倍以上の確信を要する
     pub edit_penalty: f32,
-    /// これ以下の読み（かな数）だけ補正する。長い読みは jinen の文候補の領分
+    /// これ以下の読み（かな数）だけ語として補正する。長い読みは jinen の文候補の領分
     pub word_max_chars: usize,
+    /// `word_max_chars` より長い読み（文）も補正する。1 か所直した読みを jinen で文に変換し直し、審判にかける。既定 true
+    pub sentence: bool,
 }
 
 impl Default for TypoSettings {
     fn default() -> Self {
         // edit_penalty は実測で決めた（2026-09-21、Qwen3-1.7B、λ=1）。本物の打ち間違いでは補正候補が元候補を
         // 13〜17 nat 上回り、正しく打った珍しめの語が隣の頻出語に負ける差は 7 nat だった。10 はその間
-        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8 }
+        Self { log: false, enabled: false, max_alternatives: 4, edit_penalty: 10.0, word_max_chars: 8, sentence: true }
     }
 }
 
@@ -1342,6 +1344,62 @@ impl RakunEngine {
         Some(entries.iter().map(|e| e.typed.clone()).collect())
     }
 
+    /// 今の composition の打鍵を、ローマ字の区間と固定の区間（記号・数字・直接入力）に分けて返す。
+    /// `force_preedit` で表示を差し替えた後（detach）や、区間の出力を繋いでも今の読みにならないときは None。
+    fn sentence_parts(&self) -> Option<Vec<typo::Part>> {
+        let entries = &self.input_log[self.log_detached_at.min(self.input_log.len())..];
+        if entries.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<typo::Part> = Vec::new();
+        for e in entries {
+            match (e.kind == InputKind::Romaji, parts.last_mut()) {
+                (true, Some(typo::Part::Romaji { units, output })) => {
+                    units.push(e.typed.clone());
+                    output.push_str(&e.output);
+                }
+                (true, _) => parts.push(typo::Part::Romaji { units: vec![e.typed.clone()], output: e.output.clone() }),
+                (false, _) => parts.push(typo::Part::Fixed(e.output.clone())),
+            }
+        }
+        let joined: String = parts.iter().map(typo::Part::output).collect();
+        (joined == self.hiragana_buf).then_some(parts)
+    }
+
+    /// 長い読み（文）の誤入力補正の仕事。語の補正（`append_typo_alternatives`）が扱わない長さで、審判（リランカー）が
+    /// 載っているときだけ。BG 変換のワーカーが補正後の読みを作って jinen で文にする（`conv_cache::typo_extras`）。
+    fn sentence_typo_job(&self) -> Option<conv_cache::TypoJob> {
+        let t = &self.config.typo;
+        if !t.enabled || !t.sentence || self.hiragana_buf.chars().count() <= t.word_max_chars {
+            return None;
+        }
+        #[cfg(feature = "rerank")]
+        if self.reranker.is_none() {
+            return None;
+        }
+        #[cfg(not(feature = "rerank"))]
+        return None;
+        let parts = self.sentence_parts()?;
+        let store = self.dict_store.clone()?;
+        Some(conv_cache::TypoJob { parts, store, max: t.max_alternatives })
+    }
+
+    /// 今の読みの文の誤入力補正で作る補正後の読みと編集コスト（調査用。変換経路は `sentence_typo_job` を使う）。
+    pub fn sentence_typo_alternatives(&self) -> Vec<(String, f32)> {
+        let t = &self.config.typo;
+        if !t.enabled || !t.sentence || self.hiragana_buf.chars().count() <= t.word_max_chars {
+            return Vec::new();
+        }
+        let (Some(parts), Some(store)) = (self.sentence_parts(), self.dict_store.as_ref()) else {
+            return Vec::new();
+        };
+        let word_cost = |r: &str| store.dict_top_cost(r);
+        typo::sentence_alternatives(&parts, &typo::Rule::ALL, t.max_alternatives, &word_cost)
+            .into_iter()
+            .map(|a| (a.reading, a.cost))
+            .collect()
+    }
+
     /// 誤入力補正の候補を `merged` の直後に足す（段取り 2）。戻りは（候補列, 各候補の編集コスト, 足した数）。
     ///
     /// `hiragana` が今の composition と一致するときだけ（`input_log` がその打鍵）。補正後の読みごとに辞書の
@@ -1524,6 +1582,13 @@ impl RakunEngine {
         // 並べ替えは jinen の候補が揃った最終マージで 1 回だけ。Space 直後の辞書だけの即時表示（llm 空）で
         // 採点すると表示が 6 ms → 250 ms に遅れ、しかも直後の最終マージで採点し直す（実機で観測）。
         // jinen が使えない（ロード前・失敗）ときは辞書だけのマージが最終なので、そこで並べ替える
+        // 文の誤入力補正（BG 変換が jinen で文にした補正候補）。語の補正より長い読みだけ
+        #[cfg(feature = "rerank")]
+        let sentence_extras = if hiragana.chars().count() > self.config.typo.word_max_chars && !llm_empty {
+            conv_cache::typo_extras(hiragana)
+        } else {
+            Vec::new()
+        };
         #[cfg(feature = "rerank")]
         let merged = match &self.reranker {
             Some(rr)
@@ -1536,8 +1601,30 @@ impl RakunEngine {
                 };
                 // 誤入力補正（段取り 2）: 補正後の読みの辞書候補を末尾に足し、編集コスト付きで審判にかける。
                 // 採点できないときは辞書順のまま返るので、補正候補は元の候補の後ろに残る
-                let (merged, costs, extra) = self.append_typo_alternatives(hiragana, merged, &learn_cands, &user_cands);
+                let (mut merged, mut costs, mut extra) = self.append_typo_alternatives(hiragana, merged, &learn_cands, &user_cands);
+                if extra == 0 {
+                    extra = push_sentence_extras(&mut merged, &mut costs, &sentence_extras, rr.config().max_extra);
+                }
                 rr.rerank_with_costs(left, right_context, merged, &learn_cands, &user_cands, &costs, self.config.typo.edit_penalty, extra)
+            }
+            // 長い読みは jinen の文候補どうしを並べ替えない。文の補正候補があるときだけ、元の 1 位と補正候補を審判にかける。
+            // 学習・ユーザー辞書に入っている読みは本人が確かめた表記なので補正しない
+            Some(rr)
+                if !sentence_extras.is_empty()
+                    && learn_cands.is_empty()
+                    && user_cands.is_empty()
+                    && should_rerank_now(llm_empty, self.llm_available()) =>
+            {
+                let left = match left_context {
+                    Some(l) if !l.is_empty() => l,
+                    _ => self.committed.as_str(),
+                };
+                let mut head = merged[..merged.len().min(1)].to_vec();
+                let mut costs = vec![0.0f32; head.len()];
+                let extra = push_sentence_extras(&mut head, &mut costs, &sentence_extras, rr.config().max_extra);
+                let judged = rr.rerank_with_costs(left, right_context, head, &[], &[], &costs, self.config.typo.edit_penalty, extra);
+                let rest: Vec<String> = merged.into_iter().filter(|m| !judged.contains(m)).collect();
+                judged.into_iter().chain(rest).collect()
             }
             _ => merged,
         };
@@ -1594,6 +1681,8 @@ impl RakunEngine {
             return false;
         }
 
+        // 先頭ラテン語ランを戻した読みは打鍵と 1 対 1 にならないので、文の補正はしない
+        let typo = if conv_reading == hiragana { self.sentence_typo_job() } else { None };
         if let Some(conv) = self.kanji.take() {
             match conv_cache::start(
                 hiragana,
@@ -1604,6 +1693,7 @@ impl RakunEngine {
                 self.config.digit_candidates_order.clone(),
                 matches!(self.config.alpha_width, AlphaWidth::Fullwidth),
                 matches!(self.config.symbol_width, SymbolWidth::Fullwidth),
+                typo,
             ) {
                 Some(returned) => {
                     self.kanji = Some(returned);
@@ -1699,6 +1789,24 @@ impl RakunEngine {
         models.sort_by(|a, b| a.id.cmp(&b.id));
         models
     }
+}
+
+/// 文の誤入力補正の候補を `merged` の末尾に、既にある表層を除いて `max` 個まで足す。戻りは足した数。
+#[cfg(feature = "rerank")]
+fn push_sentence_extras(merged: &mut Vec<String>, costs: &mut Vec<f32>, extras: &[(String, f32)], max: usize) -> usize {
+    let mut added = 0;
+    for (surface, cost) in extras {
+        if added >= max {
+            break;
+        }
+        if merged.contains(surface) {
+            continue;
+        }
+        merged.push(surface.clone());
+        costs.push(*cost);
+        added += 1;
+    }
+    added
 }
 
 /// このマージで並べ替えるか。`llm_empty` は LLM 候補が空（辞書だけのマージ）、`llm_available` は jinen が使える状態。
@@ -3242,6 +3350,20 @@ mod rerank_reading_gate_tests {
         assert_eq!(short[0], "機会");
         let long = e.merge_candidates_for_reading_with_context("きかいをまつしかない", cands(), 6, Some("次の"), None);
         assert_eq!(long[0], "機械");
+    }
+
+    #[test]
+    fn 長い読みでも文の補正候補があれば_元の1位と補正候補を審判にかけ_残りは後ろに続く() {
+        let mut e = engine_with_fake(5);
+        let mut config = EngineConfig::default();
+        config.typo.enabled = true;
+        e.config.typo = config.typo;
+        let reading = "つぎのきかいでhじゃなにをする";
+        conv_cache::set_typo_extras(reading, vec![("次の機会では何をする".to_string(), 0.5)]);
+        let llm = vec!["次の機会でｈじゃ何をする".to_string(), "次の機会でｈじゃなにをする".to_string()];
+        let out = e.merge_candidates_for_reading_with_context(reading, llm, 6, Some("明日は"), None);
+        // 偽の審判は 2 番目（= 補正候補）を最良にする。jinen の 2 番目は並べ替えずに後ろへ
+        assert_eq!(out[..3], ["次の機会では何をする", "次の機会でｈじゃ何をする", "次の機会でｈじゃなにをする"]);
     }
 }
 
