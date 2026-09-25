@@ -1,9 +1,9 @@
 fn main() {
-    // rerun-if-changed を一切書かないことで毎ビルド時にこのスクリプトが実行され、
-    // RAKUKAN_BUILD_TIME が常に最新のビルド時刻に更新される。
-
-    // ビルド時刻を埋め込む（DLL差し替え確認用）
-    // rerun-if-changed を書かないことで毎ビルド時に更新される
+    // ビルド時刻を埋め込む（DLL差し替え確認用）。
+    // rerun-if-changed を書かないと、Cargo はこのパッケージのファイルが変わったときしか
+    // このスクリプトを走らせない。依存の crate（rakukan-engine-rpc など）だけを直して
+    // 組み直すと、DLL は新しいのに時刻は古いまま残る。存在しないパスを渡すと毎ビルド走る。
+    println!("cargo:rerun-if-changed=.rerun-every-build");
     {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
