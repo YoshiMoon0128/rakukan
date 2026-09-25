@@ -816,7 +816,7 @@ impl RakunEngine {
     /// 確定時に呼ぶ。Backspace で消して打ち直した結果、かなが変わっていたら記録する。
     /// romaji は Backspace で書き換わる（再生用の列）ので、書くかどうかはかなで決める。
     /// `after_surface` は確定した文字列（打ち直した composition の変換結果）。MS-IME の辞書へ写すとき、
-    /// 文の長さの読み（かんじにや）には辞書の表層が無いので、これを登録する語にする
+    /// 文の長さの読み（しんじにも）には辞書の表層が無いので、これを登録する語にする
     fn flush_typo_log(&mut self, after_surface: &str) {
         let Some((before, before_kana)) = self.typo_before.take() else { return };
         let Some(log) = &self.typo_log else { return };
@@ -3439,18 +3439,18 @@ mod typo_log_tests {
     fn 消して打ち直して確定すると消す前と確定時の打鍵列が残る() {
         let dir = tempfile::tempdir().unwrap();
         let mut e = engine_with_log(dir.path());
-        type_all(&mut e, "kannnijiya");
-        assert_eq!(e.hiragana_text(), "かんにじや");
+        type_all(&mut e, "shinnnijimo");
+        assert_eq!(e.hiragana_text(), "しんにじも");
         for _ in 0..3 {
             e.backspace();
         }
-        type_all(&mut e, "jiniya");
-        assert_eq!(e.hiragana_text(), "かんじにや");
-        e.commit("感じにや");
+        type_all(&mut e, "jinimo");
+        assert_eq!(e.hiragana_text(), "しんじにも");
+        e.commit("信じにも");
         let text = std::fs::read_to_string(dir.path().join("typo.log")).unwrap();
         assert_eq!(text.lines().count(), 1);
-        assert!(text.contains(r#""before":"kannnijiya""#), "{text}");
-        assert!(text.contains(r#""before_kana":"かんにじや","after_kana":"かんじにや""#), "{text}");
+        assert!(text.contains(r#""before":"shinnnijimo""#), "{text}");
+        assert!(text.contains(r#""before_kana":"しんにじも","after_kana":"しんじにも""#), "{text}");
     }
 
     #[test]

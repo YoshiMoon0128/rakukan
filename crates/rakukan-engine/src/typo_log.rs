@@ -81,12 +81,12 @@ mod tests {
     fn 消す前と確定時の打鍵列が_1行のjsonで追記される() {
         let dir = tempfile::tempdir().unwrap();
         let log = TypoLog::new(dir.path().join("typo.log"));
-        log.record("kannijiya", "kanjiniya", "かんにじや", "かんじにや", "感じにや");
+        log.record("shinnijimo", "shinjinimo", "しんにじも", "しんじにも", "信じにも");
         log.record("a\"b", "ab", "", "", "");
         let text = std::fs::read_to_string(log.path()).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].contains(r#""before":"kannijiya","after":"kanjiniya","before_kana":"かんにじや","after_kana":"かんじにや","after_surface":"感じにや""#), "{}", lines[0]);
+        assert!(lines[0].contains(r#""before":"shinnijimo","after":"shinjinimo","before_kana":"しんにじも","after_kana":"しんじにも","after_surface":"信じにも""#), "{}", lines[0]);
         assert!(lines[1].contains(r#""before":"a\"b""#), "{}", lines[1]);
     }
 }

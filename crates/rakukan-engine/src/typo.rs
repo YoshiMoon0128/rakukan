@@ -25,7 +25,7 @@ pub enum Rule {
     Double,
     /// 抜けの挿入（"kaji" → "kanji"）
     Drop,
-    /// 余計な 1 字の削除（"hunnkakarurmi" → "hunnkakarumi"）。隣のキーを一緒に押した打ち間違いで、読みに英字が残りやすい
+    /// 余計な 1 字の削除（"kakarurmitai" → "kakarumitai"）。隣のキーを一緒に押した打ち間違いで、読みに英字が残りやすい
     Extra,
 }
 
@@ -287,7 +287,7 @@ pub struct SentenceAlt {
     /// 直した場所の前後を覆った語の mozc コストの合計（小さいほど頻出の語で説明できた）
     pub word_cost: u32,
     /// 読みに残った英字の近くで余計な 1 字を消した直し。typo.log の実測では、英字が残る打ち間違いの多くが
-    /// 隣のキーを一緒に押したもの（`hunnkakarurmi` `jasonohoukjou` `wqo`）なので、並べるときに先頭へ置く
+    /// 隣のキーを一緒に押したもの（`kakarurmitai` `houkjou` `wqo`）なので、並べるときに先頭へ置く
     pub latin_extra: bool,
 }
 
@@ -469,21 +469,21 @@ mod tests {
 
     #[test]
     fn ローマ字列は読みに戻り_未変換が残るものは捨てる() {
-        assert_eq!(romaji_to_reading("kanjiniya").as_deref(), Some("かんじにや"));
-        assert_eq!(romaji_to_reading("kannnijiya").as_deref(), Some("かんにじや"));
+        assert_eq!(romaji_to_reading("shinjinimo").as_deref(), Some("しんじにも"));
+        assert_eq!(romaji_to_reading("shinnnijimo").as_deref(), Some("しんにじも"));
         assert_eq!(romaji_to_reading("kanj"), None); // j が残る
         assert_eq!(romaji_to_reading("kaqji"), None); // q が残る
     }
 
     #[test]
     fn 隣接ユニットの入れ替えで_じ_と_に_の取り違えが直る() {
-        let u = units(&["ka", "n", "ni", "ji", "ya"]);
-        let d = dict(&["かんじ", "に", "や", "かん"]);
-        let alts = alternatives(&u, "かんにじや", &Rule::ALL, 4, &d, &flat);
+        let u = units(&["shi", "n", "ni", "ji", "mo"]);
+        let d = dict(&["しんじ", "に", "も", "しん"]);
+        let alts = alternatives(&u, "しんにじも", &Rule::ALL, 4, &d, &flat);
         // 余計な 1 字の削除でできる「かんじや」（2 区切り）が先に並ぶことがある。どちらが本命かは審判が決める
-        let fixed = alts.iter().find(|a| a.reading == "かんじにや").expect("candidate");
+        let fixed = alts.iter().find(|a| a.reading == "しんじにも").expect("candidate");
         assert_eq!(fixed.rule, Rule::TransposeUnit);
-        assert_eq!(fixed.segments, 3); // かんじ / に / や
+        assert_eq!(fixed.segments, 3); // しんじ / に / も
     }
 
     #[test]
@@ -500,11 +500,11 @@ mod tests {
 
     #[test]
     fn 元の読みと辞書で分割できない読みは出ない() {
-        let d = dict(&["かんじ", "に", "や"]);
-        let alts = alternatives(&units(&["ka", "n", "ji", "ni", "ya"]), "かんじにや", &Rule::ALL, 10, &d, &flat);
-        assert!(alts.iter().all(|a| a.reading != "かんじにや"));
-        // 「かんにじや」は かん が無く、1 かなの じ は助詞でないので分割できない
-        assert!(alts.iter().all(|a| a.reading != "かんにじや"), "{alts:?}");
+        let d = dict(&["しんじ", "に", "も"]);
+        let alts = alternatives(&units(&["shi", "n", "ji", "ni", "mo"]), "しんじにも", &Rule::ALL, 10, &d, &flat);
+        assert!(alts.iter().all(|a| a.reading != "しんじにも"));
+        // 「しんにじも」は しん が無く、1 かなの じ は助詞でないので分割できない
+        assert!(alts.iter().all(|a| a.reading != "しんにじも"), "{alts:?}");
     }
 
     #[test]
@@ -520,8 +520,8 @@ mod tests {
 
     #[test]
     fn min_segments_は1かなの区切りを助詞にだけ許す() {
-        let d = dict(&["かんじ", "に", "じ", "や"]);
-        assert_eq!(min_segments("かんじにや", &d), Some(3));
+        let d = dict(&["しんじ", "に", "じ", "も"]);
+        assert_eq!(min_segments("しんじにも", &d), Some(3));
         assert_eq!(min_segments("じ", &d), None);
         assert_eq!(min_segments("に", &d), Some(1));
     }
@@ -548,13 +548,13 @@ mod tests {
 
     #[test]
     fn 読みに英字が残る余計なキーは_1字消す直しで出る() {
-        // hunnkakarurmitai（r が余計、2026-09-24 の typo.log）→ ふんかかるみたい
-        let d = costs(&["ふん", "かかる", "みたい"]);
-        let u = ["hu", "nn", "ka", "ka", "ru", "r", "mi", "ta", "i"];
-        let parts = [romaji(&u, "ふんかかるrみたい")];
+        // jikanngakakarurmitai（r が余計）→ じかんがかかるみたい
+        let d = costs(&["じかん", "が", "かかる", "みたい"]);
+        let u = ["ji", "ka", "nn", "ga", "ka", "ka", "ru", "r", "mi", "ta", "i"];
+        let parts = [romaji(&u, "じかんがかかるrみたい")];
         let alts = sentence_alternatives(&parts, &Rule::ALL, 4, &d);
         let top = alts.first().expect("candidate");
-        assert_eq!(top.reading, "ふんかかるみたい");
+        assert_eq!(top.reading, "じかんがかかるみたい");
         assert_eq!(top.rule, Rule::Extra);
     }
 
