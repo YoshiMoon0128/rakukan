@@ -198,6 +198,9 @@ pub fn target_indices(merged: &[String], learn: &[String], user: &[String], max_
 /// 候補がこれ以上の文字数の頭を共有していたら、その頭は左文脈に回して採点する（`shared_head`）
 const SHARED_HEAD_MIN_CHARS: usize = 4;
 
+/// 元の候補を並べ替えるのに要る文脈の長さ（左右どちらかの文字数）。これ未満なら補正候補の審判だけにする
+const MIN_CONTEXT_CHARS: usize = 3;
+
 /// 全候補に共通する頭（文字単位）。どの候補にも 1 文字以上残る長さまで。`SHARED_HEAD_MIN_CHARS` 未満なら 0。
 ///
 /// 点は log P(候補 | 左文脈) で、候補どうしの差（log_softmax）だけが順位に効く。共通の頭の log P は全候補に同じだけ
@@ -599,15 +602,20 @@ impl Reranker {
             tracing::debug!("rerank: skipped reason=no_right_context");
             return merged;
         }
-        // 文脈が左右どちらも無いとき（文書の先頭で確定文も無い）は並べ替えない。
-        // 文脈ゼロの LM の好みは辞書順より当たらない（実機で「きかい」に「奇怪」が先頭に来た）
-        if left.trim().is_empty() && right_empty {
-            tracing::debug!("rerank: skipped reason=no_context extra={extra}");
-            return merged;
-        }
         // 補正候補は KV の sequence 数（max_extra）まで。余った補正候補は末尾に残る
         let extra = extra.min(self.cfg.max_extra).min(merged.len());
-        let idx = target_indices(&merged, learn, user, self.cfg.max_candidates, extra);
+        let mut idx = target_indices(&merged, learn, user, self.cfg.max_candidates, extra);
+        // 左右の文脈がどちらも短いときは、元の候補を並べ替えず、元の 1 位と補正候補だけを比べる。
+        // 文脈が無い LM の点は候補の文字列そのもののありふれ度になり、辞書順に負ける（実機で「さいてすと」の
+        // 1 位に sitest、「きかい」に「奇怪」）。fixture の左文脈を末尾 k 字に削った評価（右文脈なし、Qwen3-1.7B）で、
+        // 自然分布 60 行の top-1 は辞書順 0.88 に対し 3 字 0.92・2 字 0.75・空 0.57（ime-rerank の eval_short_context.py）
+        let left_chars = left.trim().chars().count();
+        let right_chars = right.map_or(0, |r| r.trim().chars().count());
+        if left_chars < MIN_CONTEXT_CHARS && right_chars < MIN_CONTEXT_CHARS {
+            let n_orig = idx.len() - extra;
+            idx = idx.iter().enumerate().filter(|&(k, _)| k == 0 || k >= n_orig).map(|(_, &i)| i).collect();
+            tracing::debug!("rerank: short context left={left_chars} right={right_chars}, judging top and extra={extra} only");
+        }
         if idx.len() < 2 {
             tracing::debug!("rerank: skipped reason=single_target targets={}", idx.len());
             return merged;
@@ -768,7 +776,7 @@ mod tests {
         let rr = Reranker::spawn(cfg, Duration::from_secs(1), move || Ok(Box::new(Count(seen2)) as Box<dyn ScoreBackend>));
         assert!(rr.wait_ready(Duration::from_secs(5)));
         let merged = s(&["a", "b", "c", "x1", "x2", "x3"]);
-        let out = rr.rerank_with_costs("左", None, merged, &[], &[], &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2.0, 3);
+        let out = rr.rerank_with_costs("左の文",None, merged, &[], &[], &[0.0, 0.0, 0.0, 1.0, 1.0, 1.0], 2.0, 3);
         assert_eq!(*seen.lock().unwrap(), 3);
         assert_eq!(out.len(), 6);
     }
@@ -836,16 +844,28 @@ mod tests {
     fn 採点器のロードに失敗しても辞書順のまま返る() {
         let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), || Err("no model".into()));
         assert!(!rr.wait_ready(Duration::from_secs(5)));
-        assert_eq!(rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("左の文",None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
     }
 
     #[test]
-    fn 文脈が左右どちらも無ければ並べ替えない() {
+    fn 左右の文脈がどちらも3字に満たなければ並べ替えない() {
         let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), || fake(None));
         assert!(rr.wait_ready(Duration::from_secs(5)));
         assert_eq!(rr.rerank("", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
-        assert_eq!(rr.rerank("次の", None, s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
+        assert_eq!(rr.rerank("次の", Some("を"), s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("工場の", None, s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
         assert_eq!(rr.rerank("", Some("を待つ"), s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
+    }
+
+    #[test]
+    fn 文脈が短くても補正候補は元の1位と比べ_元の候補の順は変えない() {
+        let rr = Reranker::spawn(RerankConfig::default(), Duration::from_secs(1), || fake(None));
+        assert!(rr.wait_ready(Duration::from_secs(5)));
+
+        // 採点するのは「かんひ」と補正候補「感じ」だけ。偽の採点器は 2 番目（= 感じ）を最良にする
+        let out = rr.rerank_with_costs("", None, s(&["かんひ", "官費", "感じ"]), &[], &[], &[0.0, 0.0, 1.0], 0.1, 1);
+
+        assert_eq!(out, s(&["感じ", "かんひ", "官費"]));
     }
 
     #[test]
@@ -853,8 +873,8 @@ mod tests {
         let cfg = RerankConfig { require_right_context: true, ..RerankConfig::default() };
         let rr = Reranker::spawn(cfg, Duration::from_secs(1), || fake(None));
         assert!(rr.wait_ready(Duration::from_secs(5)));
-        assert_eq!(rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
-        assert_eq!(rr.rerank("左", Some("を"), s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
+        assert_eq!(rr.rerank("左の文",None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("左の文",Some("を"), s(&["機械", "機会"]), &[], &[]), s(&["機会", "機械"]));
     }
 
     #[test]
@@ -863,9 +883,9 @@ mod tests {
         let rr = Reranker::spawn(RerankConfig::default(), Duration::from_millis(20), move || fake(Some(gate)));
         assert!(rr.wait_ready(Duration::from_secs(5)));
         // 1 回目: 採点器が止まっているのでタイムアウト → 辞書順
-        assert_eq!(rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("左の文",None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
         // 2 回目: 見捨てた採点がまだ終わっていないのでスキップ → 辞書順
-        assert_eq!(rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
+        assert_eq!(rr.rerank("左の文",None, s(&["機械", "機会"]), &[], &[]), s(&["機械", "機会"]));
         // 採点器を進める。見捨てた 1 回目の結果が届いた後は普通に採点される
         open.send(()).unwrap();
         for _ in 0..20 {
@@ -874,7 +894,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut out = s(&["機械", "機会"]);
         while out[0] != "機会" && Instant::now() < deadline {
-            out = rr.rerank("左", None, s(&["機械", "機会"]), &[], &[]);
+            out = rr.rerank("左の文",None, s(&["機械", "機会"]), &[], &[]);
         }
         assert_eq!(out, s(&["機会", "機械"]));
     }

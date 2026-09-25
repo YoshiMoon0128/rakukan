@@ -3508,9 +3508,9 @@ mod rerank_reading_gate_tests {
     fn 読みが上限以下なら採点し上限を超えたら辞書順のまま() {
         let e = engine_with_fake(5);
         let cands = || vec!["機械".to_string(), "機会".to_string()];
-        let short = e.merge_candidates_for_reading_with_context("きかい", cands(), 6, Some("次の"), None);
+        let short = e.merge_candidates_for_reading_with_context("きかい", cands(), 6, Some("明日の次の"), None);
         assert_eq!(short[0], "機会");
-        let long = e.merge_candidates_for_reading_with_context("きかいをまつしかない", cands(), 6, Some("次の"), None);
+        let long = e.merge_candidates_for_reading_with_context("きかいをまつしかない", cands(), 6, Some("明日の次の"), None);
         assert_eq!(long[0], "機械");
     }
 
