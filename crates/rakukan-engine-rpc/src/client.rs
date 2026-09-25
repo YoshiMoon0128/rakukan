@@ -29,7 +29,9 @@ pub const HOST_EXE_NAME: &str = "rakukan-engine-host.exe";
 const HOST_FAILURE_THRESHOLD: u32 = 3;
 const HOST_FAILURE_WINDOW_MS: u64 = 15_000;
 const HOST_FAILURE_COOLDOWN_MS: u64 = 30_000;
-const CONNECT_WHILE_BLOCKED_MS: u64 = 500;
+/// 起動を休んでいる間に、既に居る host（別のアプリの TSF が起こしたもの）をのぞく時間。
+/// 打鍵のたびに呼ばれるので短くする。500 ms だと 1 打鍵ごとにアプリの UI スレッドが止まった
+const CONNECT_WHILE_BLOCKED_MS: u64 = 30;
 
 /// spawn するホストへ渡すエンジン DLL のログレベル（`RAKUKAN_LOG`）。
 ///
@@ -687,60 +689,73 @@ impl Connection {
     /// failure が記録されても、2 回目で成功すれば record_success が呼ばれて
     /// カウンタはリセットされる（仕様: HOST_FAILURE_THRESHOLD=3 なので 1 回の
     /// 余分な失敗で本物の cooldown に入ることはない）。
+    ///
+    /// host を起こせなかったとき（アプリ制御に起動を拒否された、exe が無い）と、起動を休んでいるときは
+    /// やり直さない。この関数は TSF からアプリの UI スレッドで呼ばれるので、来ない host を待つと
+    /// 打鍵のたびにアプリが固まる（2026-09-26、host の起動が拒否され 1 回の RPC が 11〜22 秒止まった）。
     fn ensure_connected(&mut self) -> Result<()> {
         if self.stream.is_some() {
             return Ok(());
         }
-        if let Err(first_err) = self.try_connect_once() {
-            tracing::warn!(
-                "ensure_connected: handshake failed ({first_err}); retrying after 200ms"
-            );
-            std::thread::sleep(Duration::from_millis(200));
-            return self
-                .try_connect_once()
-                .with_context(|| format!("retry after first failure: {first_err}"));
+        match self.try_connect_once() {
+            Ok(()) => Ok(()),
+            Err(first) if !first.retry => Err(first.error),
+            Err(first) => {
+                let first_err = first.error;
+                tracing::warn!(
+                    "ensure_connected: handshake failed ({first_err}); retrying after 200ms"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+                self.try_connect_once().map_err(|second| {
+                    second
+                        .error
+                        .context(format!("retry after first failure: {first_err}"))
+                })
+            }
         }
-        Ok(())
     }
 
     /// `ensure_connected` の本体（connect → Hello → Create）。失敗時は
     /// `self.stream = None` に戻して `host_spawn_guard` に failure を記録する。
-    /// リトライは `ensure_connected` 側で行う。
-    fn try_connect_once(&mut self) -> Result<()> {
+    /// リトライは `ensure_connected` 側で、失敗の `retry` が true のときだけ行う。
+    fn try_connect_once(&mut self) -> std::result::Result<(), ConnectFailure> {
         let pipe_name = pipe_name_for_current_user();
+        // 短時間に連続失敗している間は spawn を一時停止し、Explorer などの TSF ホストから
+        // 外部プロセス起動を連打しない。その間は既に居る host を短くのぞくだけにする
+        let suppressed = host_spawn_guard_can_spawn().err();
+        let first_wait = if suppressed.is_some() {
+            Duration::from_millis(CONNECT_WHILE_BLOCKED_MS)
+        } else {
+            Duration::from_millis(300)
+        };
 
         // 1. まず接続を試行
-        match PipeStream::connect_client(&pipe_name, Duration::from_millis(300)) {
+        match PipeStream::connect_client(&pipe_name, first_wait) {
             Ok(s) => {
                 self.stream = Some(s);
             }
             Err(initial_err) => {
-                // 2. 失敗: 既存ホストへ短時間だけ再接続を試み、それでも駄目なら spawn。
-                // 短時間に連続失敗している間は spawn を一時停止し、Explorer などの
-                // TSF ホストから外部プロセス起動を連打しない。
-                match host_spawn_guard_can_spawn() {
-                    Ok(()) => {
-                        if let Err(e) = spawn_host() {
-                            tracing::warn!("spawn_host failed: {e}");
-                        }
-                        let s = PipeStream::connect_client(&pipe_name, Duration::from_secs(5))
-                            .with_context(|| format!("connect after spawn to {pipe_name}"))?;
-                        self.stream = Some(s);
-                    }
-                    Err(blocked_err) => {
-                        tracing::warn!(
-                            "host spawn suppressed after repeated failures: {blocked_err}"
-                        );
-                        let s = PipeStream::connect_client(
-                            &pipe_name,
-                            Duration::from_millis(CONNECT_WHILE_BLOCKED_MS),
-                        )
-                        .with_context(|| {
-                            format!(
-                                "connect while spawn suppressed to {pipe_name} (initial error: {initial_err})"
-                            )
-                        })?;
-                        self.stream = Some(s);
+                if let Some(blocked_err) = suppressed {
+                    tracing::warn!("host spawn suppressed after repeated failures: {blocked_err}");
+                    return Err(ConnectFailure::fatal(anyhow!(
+                        "no host while spawn suppressed to {pipe_name} ({blocked_err}); initial error: {initial_err}"
+                    )));
+                }
+                // 2. 失敗: spawn する。起動できなければパイプを待っても host は来ないので、待たずに失敗を数える
+                if let Err(e) = spawn_host() {
+                    tracing::warn!("spawn_host failed: {e}");
+                    host_spawn_guard_record_failure();
+                    return Err(ConnectFailure::fatal(
+                        e.context(format!("spawn host (initial error: {initial_err})")),
+                    ));
+                }
+                match PipeStream::connect_client(&pipe_name, Duration::from_secs(5)) {
+                    Ok(s) => self.stream = Some(s),
+                    Err(e) => {
+                        host_spawn_guard_record_failure();
+                        return Err(ConnectFailure::fatal(
+                            e.context(format!("connect after spawn to {pipe_name}")),
+                        ));
                     }
                 }
             }
@@ -786,9 +801,22 @@ impl Connection {
             Err(e) => {
                 self.stream = None;
                 host_spawn_guard_record_failure();
-                Err(e)
+                // host は居る。reload 直後の exit と行き違っただけなら、もう 1 回で通る
+                Err(ConnectFailure { error: e, retry: true })
             }
         }
+    }
+}
+
+/// `try_connect_once` の失敗。`retry` は「host は居て、もう 1 回つなげば通りうる」とき true。
+struct ConnectFailure {
+    error: anyhow::Error,
+    retry: bool,
+}
+
+impl ConnectFailure {
+    fn fatal(error: anyhow::Error) -> Self {
+        Self { error, retry: false }
     }
 }
 
