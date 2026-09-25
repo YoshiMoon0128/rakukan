@@ -1438,11 +1438,21 @@ impl RakunEngine {
         self.reranker = reranker;
     }
 
+    /// `entries[i]` を打ち間違いの補正でローマ字の打鍵として扱うか。ローマ字のエントリと、ローマ字に挟まれた
+    /// 数字の `0`（`-` や `o` のつもりで上の段を押した打ち間違い。本人の打鍵で「にま0じ」）。
+    /// `10じ` `0じ` の `0` は数字として打ったものなので対象にしない
+    fn typo_romaji_entry(entries: &[InputEntry], i: usize) -> bool {
+        let romaji = |j: usize| entries.get(j).is_some_and(|e| e.kind == InputKind::Romaji);
+        let e = &entries[i];
+        e.kind == InputKind::Romaji || (e.kind == InputKind::Digit && e.typed == "0" && i > 0 && romaji(i - 1) && romaji(i + 1))
+    }
+
     /// 今の composition の打鍵を romaji ユニット（1 かなぶんの `typed`）で返す。
     /// `force_preedit` で表示を差し替えた後（detach）や、数字・記号・Shift 英字が混ざるときは None。
+    /// ローマ字に挟まれた `0` は打鍵のまま入れる（`typo_romaji_entry`）。
     fn romaji_units(&self) -> Option<Vec<String>> {
         let entries = &self.input_log[self.log_detached_at.min(self.input_log.len())..];
-        if entries.is_empty() || entries.iter().any(|e| e.kind != InputKind::Romaji) {
+        if entries.is_empty() || (0..entries.len()).any(|i| !Self::typo_romaji_entry(entries, i)) {
             return None;
         }
         let output: String = entries.iter().map(|e| e.output.as_str()).collect();
@@ -1463,8 +1473,8 @@ impl RakunEngine {
         }
         let punct = |s: &str| !s.is_empty() && s.chars().all(|c| !typo::is_kana(c) && !c.is_alphanumeric());
         let mut parts: Vec<typo::Part> = Vec::new();
-        for e in entries {
-            let romaji = e.kind == InputKind::Romaji && !punct(&e.output);
+        for (i, e) in entries.iter().enumerate() {
+            let romaji = Self::typo_romaji_entry(entries, i) && !punct(&e.output);
             match (romaji, parts.last_mut()) {
                 (true, Some(typo::Part::Romaji { units, output })) => {
                     units.push(e.typed.clone());
@@ -3603,6 +3613,22 @@ mod typo_integration_tests {
         // 窓は元 6 個（かんひ は辞書に無いので llm の 6 個）+ 補正 1 個。Second は 2 番目を最良にするので
         // 感じ は末尾ではなく採点ブロック（先頭 7 個）の中にいる
         assert!(out.iter().position(|s| s == "感じ").unwrap() < 7, "{out:?}");
+    }
+
+    #[test]
+    fn ローマ字に挟まれた0はハイフンの打ち間違いとして直す() {
+        // `-` のつもりで上の段の `0` を押す（本人の conv.log の「にま0じ」）
+        let (mut e, _dir) = engine(true);
+        let user_path = _dir.path().join("user_dict2.toml");
+        std::fs::write(&user_path, "[[entries]]\nreading = \"まーじ\"\nsurfaces = [\"マージ\"]\n").unwrap();
+        e.set_dict_store(DictStore::load(Some(&user_path), None, None).unwrap());
+        for c in "ma0ji".chars() {
+            e.push_char(c);
+        }
+
+        let out = e.merge_candidates_for_reading_with_context(e.hiragana_text().to_string().as_str(), vec!["ま0じ".into()], 6, Some("いい"), None);
+
+        assert_eq!(out[0], "マージ", "{out:?}");
     }
 
     #[test]

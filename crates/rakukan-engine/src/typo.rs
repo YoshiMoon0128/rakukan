@@ -69,8 +69,15 @@ pub struct Alt {
 /// QWERTY の英字の並び。JIS / US で同じ。
 const ROWS: [&str; 3] = ["qwertyuiop", "asdfghjkl", "zxcvbnm"];
 
+/// 数字の段の `0` を押したときに狙っていたキー。`-`（長音）と `o` `p` は `0` の右と下。
+/// 数字の段を `ROWS` に足すと、全部の英字で数字への置き換えを試すことになるので `0` だけ持つ
+const ZERO_SLIPS: [char; 3] = ['-', 'o', 'p'];
+
 /// 隣のキー（同じ行の左右と、上下の行の同じ列 ±1）。
 pub fn adjacent_keys(c: char) -> Vec<char> {
+    if c == '0' {
+        return ZERO_SLIPS.to_vec();
+    }
     let mut out = Vec::new();
     for (r, row) in ROWS.iter().enumerate() {
         let Some(i) = row.find(c) else { continue };
