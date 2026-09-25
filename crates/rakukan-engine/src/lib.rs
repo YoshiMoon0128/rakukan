@@ -39,6 +39,7 @@ pub mod segments;
 pub mod rerank;
 pub mod typo;
 pub mod typo_log;
+pub mod conv_log;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
 pub use backend::Backend as RakunBackend;
@@ -714,7 +715,20 @@ pub struct RakunEngine {
     typo_log: Option<typo_log::TypoLog>,
     /// 今の composition で最初に Backspace を押した直前の（romaji、かな）。確定時のかなと比べて記録する
     typo_before: Option<(String, String)>,
+    /// 変換の記録（`[typo] log = true`）。None なら記録しない
+    conv_log: Option<conv_log::ConvLog>,
+    /// 最後に並べた候補（読み、候補、上限、左文脈、右文脈）。確定時に何番目を選んだかを出す。
+    /// 並べるのは `&self` の経路なので Mutex に置く。記録しないときは触らない
+    last_merge: std::sync::Mutex<Option<LastMerge>>,
     dict_store: Option<DictStore>,
+}
+
+struct LastMerge {
+    reading: String,
+    cands: Vec<String>,
+    limit: usize,
+    left: String,
+    right: String,
 }
 
 impl RakunEngine {
@@ -729,6 +743,7 @@ impl RakunEngine {
         if let Some(l) = &typo_log {
             info!("typo log enabled: {}", l.path().display());
         }
+        let conv_log = config.typo.log.then(conv_log::ConvLog::at_default_path);
         Self {
             romaji: RomajiConverter::new(),
             kanji: None,
@@ -742,6 +757,8 @@ impl RakunEngine {
             reranker,
             typo_log,
             typo_before: None,
+            conv_log,
+            last_merge: std::sync::Mutex::new(None),
             dict_store: None,
         }
     }
@@ -749,6 +766,51 @@ impl RakunEngine {
     /// 打ち間違いの計測ログを差し替える（None で止める）。テストと CLI 用。
     pub fn set_typo_log(&mut self, log: Option<typo_log::TypoLog>) {
         self.typo_log = log;
+    }
+
+    /// 変換の記録を差し替える（None で止める）。テストと CLI 用。
+    pub fn set_conv_log(&mut self, log: Option<conv_log::ConvLog>) {
+        self.conv_log = log;
+    }
+
+    fn remember_merge(&self, reading: &str, cands: &[String], limit: usize, left: Option<&str>, right: Option<&str>) {
+        if self.conv_log.is_none() {
+            return;
+        }
+        let left = match left {
+            Some(l) if !l.is_empty() => l,
+            _ => self.committed.as_str(),
+        };
+        let m = LastMerge {
+            reading: reading.to_string(),
+            cands: cands.to_vec(),
+            limit,
+            left: left.to_string(),
+            right: right.unwrap_or("").to_string(),
+        };
+        match self.last_merge.lock() {
+            Ok(mut g) => *g = Some(m),
+            Err(p) => *p.into_inner() = Some(m),
+        }
+    }
+
+    /// 確定時に呼ぶ。候補を並べていない読み（ひらがなのまま確定など）も、候補を空で記録する
+    fn record_conversion(&mut self, committed: &str) {
+        let Some(log) = &self.conv_log else { return };
+        if self.hiragana_buf.is_empty() {
+            return;
+        }
+        let last = match self.last_merge.lock() {
+            Ok(mut g) => g.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        let last = last.filter(|m| m.reading == self.hiragana_buf);
+        let keys = self.romaji_log_str();
+        let (cands, limit, left, right) = match &last {
+            Some(m) => (m.cands.as_slice(), m.limit, m.left.as_str(), m.right.as_str()),
+            None => (&[][..], 0, self.committed.as_str(), ""),
+        };
+        log.record(&conv_log::ConvRecord { reading: &self.hiragana_buf, keys: &keys, committed, cands, limit, left, right });
     }
 
     /// 確定時に呼ぶ。Backspace で消して打ち直した結果、かなが変わっていたら記録する。
@@ -1259,6 +1321,7 @@ impl RakunEngine {
     pub fn commit(&mut self, text: &str) {
         info!("engine::commit: {:?}", text);
         self.flush_typo_log(text);
+        self.record_conversion(text);
         if is_context_echo_risk(text) {
             // 未変換のまま確定されたひらがな文を context に入れると、同じ読みの
             // 変換で LLM がコピー（エコー）に収束する（v0.9.15 のエコーアトラクタ）。
@@ -1688,11 +1751,9 @@ impl RakunEngine {
             merged.push(hiragana.to_string());
         }
 
-        if merged.is_empty() {
-            vec![hiragana.to_string()]
-        } else {
-            merged
-        }
+        let merged = if merged.is_empty() { vec![hiragana.to_string()] } else { merged };
+        self.remember_merge(hiragana, &merged, limit, left_context, right_context);
+        merged
     }
 
     /// エンジン内部の `hiragana_buf` を reading として辞書をマージする。
@@ -3563,5 +3624,57 @@ mod typo_integration_tests {
         // 別の読みで呼ばれた（BG の take_key など）ときは input_log が対応しないので補正しない
         let out = e.merge_candidates_for_reading_with_context("かんび", vec!["かんび".into()], 6, Some("いい"), None);
         assert!(!out.contains(&"感じ".to_string()), "{out:?}");
+    }
+}
+
+#[cfg(test)]
+mod conv_log_tests {
+    //! 変換の記録（`[typo] log`）。確定のたびに、並べた候補の何番目を確定したかを残す。
+    use super::*;
+
+    fn engine_with_log(dir: &std::path::Path) -> RakunEngine {
+        let mut e = RakunEngine::new(EngineConfig::default());
+        e.set_conv_log(Some(conv_log::ConvLog::new(dir.join("conv.log"))));
+        e
+    }
+
+    #[test]
+    fn 並べた候補の何番目を確定したかが残る() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with_log(dir.path());
+        for c in "kikai".chars() {
+            e.push_char(c);
+        }
+        e.merge_candidates_for_reading_with_context("きかい", vec!["機会".into(), "機械".into()], 9, Some("工場の"), None);
+
+        e.commit("機械");
+
+        let text = std::fs::read_to_string(dir.path().join("conv.log")).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        assert!(text.contains(r#""reading":"きかい","keys":"kikai","committed":"機械","rank":1,"cands":["機会","機械""#), "{text}");
+        assert!(text.contains(r#""left":"工場の""#), "{text}");
+    }
+
+    #[test]
+    fn 並べずに確定した読みは候補を空で残す() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = engine_with_log(dir.path());
+        for c in "kana".chars() {
+            e.push_char(c);
+        }
+        // 前の composition で別の読みを並べていても、それは使わない
+        e.merge_candidates_for_reading("きかい", vec!["機会".into()], 9);
+
+        e.commit_as_hiragana();
+
+        let text = std::fs::read_to_string(dir.path().join("conv.log")).unwrap();
+        assert!(text.contains(r#""committed":"かな","rank":null,"cands":[]"#), "{text}");
+    }
+
+    #[test]
+    fn 記録を切っていれば変換の記録を持たない() {
+        let e = RakunEngine::new(EngineConfig::default());
+
+        assert!(e.conv_log.is_none());
     }
 }
