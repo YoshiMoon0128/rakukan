@@ -1026,6 +1026,51 @@ impl RakunEngine {
     /// detach 後（`force_preedit` の後）や log と表示が対応しないときは、現行どおり
     /// 表示 1 文字とエントリ 1 つを消す。
     fn pop_display_char(&mut self) -> bool {
+        let popped = self.pop_display_char_and_close();
+        if popped {
+            self.reopen_trailing_latin();
+        }
+        popped
+    }
+
+    /// Backspace のあと、末尾に残ったのが素通しで閉じた英字（`y` + `0` の `y`、`k` + `。` の `k`）なら未確定に戻す。
+    ///
+    /// 閉じたままだと次の母音が単独のかなになり、`shiy0` ⌫ `o` が「しよ」でなく「しyお」になる。
+    /// 戻すのは打鍵がそのまま出力になったエントリに限る。「っ」「ん」のように再生すると崩れるエントリ
+    /// （区間を閉じる理由）は出力がかななので対象にならない。未確定は出力から作り直すので、
+    /// `tta` 用に末尾エントリへ畳み込まれた未確定（`yt` の `t`）もここで消える。
+    fn reopen_trailing_latin(&mut self) {
+        if self.input_log.len() <= self.log_detached_at || !self.pending_romaji_buf.is_empty() {
+            return;
+        }
+        let Some(last) = self.input_log.last() else {
+            return;
+        };
+        // 打鍵がそのまま出力になったエントリだけ（「っ」「ん」は `tt` `nn` で始まらない）
+        if last.kind != InputKind::Romaji
+            || last.output.is_empty()
+            || !last.typed.starts_with(&last.output)
+            || !self.hiragana_buf.ends_with(&last.output)
+        {
+            return;
+        }
+        let e = self.input_log.pop().expect("checked above");
+        let keep = self.hiragana_buf.len() - e.output.len();
+        self.hiragana_buf.truncate(keep);
+        let (entries, pending, conv) = replay_romaji_run(&e.output);
+        for entry in &entries {
+            self.hiragana_buf.push_str(&entry.output);
+        }
+        self.input_log.extend(entries);
+        debug!(
+            "engine::backspace: reopened {:?} as pending {:?}",
+            e.typed, pending
+        );
+        self.pending_romaji_buf = pending;
+        self.romaji = conv;
+    }
+
+    fn pop_display_char_and_close(&mut self) -> bool {
         let Some(removed) = self.hiragana_buf.pop() else {
             return false;
         };
@@ -2849,14 +2894,41 @@ mod close_pending_tests {
     }
 
     #[test]
-    fn closed_consonant_stays_confirmed_after_backspace() {
+    fn 記号を消すと手前の閉じた子音が未確定に戻る() {
         let mut e = engine();
         e.push_char('k');
         e.push_raw('。');
+
         assert!(e.backspace());
-        assert_eq!(e.current_preedit().display(), "k");
         e.push_char('a');
-        assert_eq!(e.current_preedit().display(), "kあ");
+
+        assert_eq!(e.current_preedit().display(), "か");
+    }
+
+    #[test]
+    fn 数字を消すと手前の英字が次の母音と合わさる() {
+        // `o` のつもりで `0` を押し、消して打ち直す
+        let mut e = engine();
+        type_all(&mut e, "shiy0");
+
+        assert!(e.backspace());
+        e.push_char('o');
+
+        assert_eq!(e.hiragana_text(), "しよ");
+    }
+
+    #[test]
+    fn 消したかなの打鍵は記録に残らない() {
+        // `y` のあと `tu` を打ち、「つ」を消して `ru` を打つ。消した `t` が打鍵の記録に残ると、
+        // 打ち間違いの補正は `y` を消しても読みを作れない
+        let mut e = engine();
+        type_all(&mut e, "kuytu");
+
+        assert!(e.backspace());
+        type_all(&mut e, "ru");
+
+        assert_eq!(e.hiragana_text(), "くyる");
+        assert_eq!(e.romaji_log_str(), "kuyru");
     }
 
     #[test]
