@@ -281,10 +281,19 @@ fn dispatch(engine: &SharedEngine, req: Request) -> Response {
         }
         Request::Create { config_json } => {
             let mut g = lock_engine(engine);
-            if g.engine.is_some() && engine.config_snapshot() == config_json {
-                return Response::Unit;
-            }
             if g.engine.is_some() {
+                let current = engine.config_snapshot();
+                if current == config_json {
+                    return Response::Unit;
+                }
+                if let (Some(inc), Some(cur)) = (config_json.as_deref(), current.as_deref()) {
+                    if config_omits_keys_only(inc, cur) {
+                        tracing::info!(
+                            "rpc: Create from a client that omits newer config keys, keeping current engine"
+                        );
+                        return Response::Unit;
+                    }
+                }
                 tracing::info!(
                     "rpc: Create requested with changed config, reloading current engine"
                 );
@@ -614,4 +623,57 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
 #[allow(dead_code)]
 pub fn sleep_short() {
     std::thread::sleep(Duration::from_millis(50));
+}
+
+/// 届いた config が、いまの config からキーを抜いただけのものかを見る。
+///
+/// TSF の DLL はアプリが終わるまで載ったままなので、載せ替えのあとも古い DLL を掴んだ
+/// アプリ（explorer など）が残る。古い DLL は自分の知らないキー（`rerank.gpu_layers` など）を
+/// config JSON に載せないため、文字列で比べると常に「変わった」になり、engine を古い DLL の
+/// 既定値で作り直してしまう。知っているキーの値が全部同じなら、同じ config.toml を読んだ
+/// 古いクライアントと見なす。
+fn config_omits_keys_only(incoming: &str, current: &str) -> bool {
+    fn covered(part: &serde_json::Value, whole: &serde_json::Value) -> bool {
+        match (part, whole) {
+            (serde_json::Value::Object(p), serde_json::Value::Object(w)) => p
+                .iter()
+                .all(|(k, v)| w.get(k).is_some_and(|wv| covered(v, wv))),
+            _ => part == whole,
+        }
+    }
+    match (
+        serde_json::from_str::<serde_json::Value>(incoming),
+        serde_json::from_str::<serde_json::Value>(current),
+    ) {
+        (Ok(i), Ok(c)) => covered(&i, &c),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::config_omits_keys_only;
+
+    const CURRENT: &str = r#"{"num_candidates":9,"n_gpu_layers":16,"rerank":{"enabled":true,"model":"qwen3-1.7b-q8_0","timeout_ms":300,"gpu_layers":999}}"#;
+
+    #[test]
+    fn 新しいキーを知らない古いクライアントの_config_は同じと見なす() {
+        let old_client = r#"{"num_candidates":9,"n_gpu_layers":16,"rerank":{"enabled":true,"model":"qwen3-1.7b-q8_0","timeout_ms":300}}"#;
+
+        assert!(config_omits_keys_only(old_client, CURRENT));
+    }
+
+    #[test]
+    fn 知っているキーの値が違えば別の_config_と見なす() {
+        let changed = r#"{"num_candidates":9,"n_gpu_layers":16,"rerank":{"enabled":true,"model":"qwen3-1.7b-q8_0","timeout_ms":250}}"#;
+
+        assert!(!config_omits_keys_only(changed, CURRENT));
+    }
+
+    #[test]
+    fn いまの_config_に無いキーが届いたら別の_config_と見なす() {
+        let old_current = r#"{"num_candidates":9,"n_gpu_layers":16,"rerank":{"enabled":true,"model":"qwen3-1.7b-q8_0","timeout_ms":300}}"#;
+
+        assert!(!config_omits_keys_only(CURRENT, old_current));
+    }
 }

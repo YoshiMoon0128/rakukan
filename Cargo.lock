@@ -1612,6 +1612,7 @@ dependencies = [
  "postcard",
  "rakukan-engine-abi",
  "serde",
+ "serde_json",
  "tracing",
  "windows",
 ]

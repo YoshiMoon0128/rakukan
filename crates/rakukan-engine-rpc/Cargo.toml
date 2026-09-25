@@ -11,6 +11,7 @@ rakukan-engine-abi = { path = "../rakukan-engine-abi" }
 anyhow   = { workspace = true }
 tracing  = { workspace = true }
 serde    = { workspace = true }
+serde_json = { workspace = true }
 postcard = { version = "1", features = ["use-std"] }
 
 [dependencies.windows]
